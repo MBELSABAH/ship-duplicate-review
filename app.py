@@ -79,11 +79,12 @@ def app():
     init_state()
 
     st.title(APP_TITLE)
-    st.caption("Safe auto-merges + manual review + merge history + undo.")
+    st.caption("Safe auto-merges, manual review, merge history, and reviewed export.")
 
     with st.sidebar:
-        st.header("Setup")
+        st.header("Workbook")
         uploaded = st.file_uploader("Upload Excel workbook", type=["xlsx", "xls"])
+        st.header("Matching settings")
         fuzzy_threshold = st.slider(
             "Name-match strictness",
             60,
@@ -100,8 +101,10 @@ def app():
             0.01,
             help="Filters generated pairs by combined evidence score. Lower this if generated pairs are hidden.",
         )
+        st.header("Review behavior")
         hide_reviewed_candidates = st.checkbox("Hide reviewed candidates", value=True)
         sample_rows = st.slider("Sample original rows per side", 3, 12, 5, 1)
+        st.header("Reset")
         if st.button("Reset all decisions", use_container_width=True):
             st.session_state["auto_status"] = {}
             st.session_state["manual_decisions"] = {}
@@ -194,13 +197,17 @@ def app():
 
     stat_lookup = stats_df.set_index("raw_name").to_dict("index")
 
+    auto_preview_df = auto_groups_df.copy()
+    auto_preview_df["status"] = auto_preview_df["auto_group_key"].map(lambda gid: st.session_state["auto_status"].get(gid, "pending"))
+    visible_auto_count = len(auto_preview_df[auto_preview_df["status"] == "pending"]) if hide_reviewed_candidates else len(auto_preview_df)
+
     metrics = st.columns(5)
-    metrics[0].metric("Unique raw primary values", len(stats_df))
-    metrics[1].metric("Safe auto-groups", len(auto_groups_df))
-    metrics[2].metric("Accepted auto-groups", sum(1 for v in st.session_state["auto_status"].values() if v == "accepted"))
-    metrics[3].metric("Manual queue", len(visible_queue_df) if visible_queue_df is not None else 0)
-    metrics[4].metric("Merged names now", len(mapping_df))
-    st.caption(f"Manual decisions in current mapping: {len(active_manual_decisions)} (total saved: {len(st.session_state['manual_decisions'])}).")
+    metrics[0].metric("Unique primary values", len(stats_df))
+    metrics[1].metric("Safe auto-groups visible/total", f"{visible_auto_count}/{len(auto_groups_df)}")
+    metrics[2].metric("Manual candidates visible/generated", f"{len(visible_queue_df) if visible_queue_df is not None else 0}/{len(score_filtered_queue_df)}")
+    metrics[3].metric("Manual decisions saved", len(active_manual_decisions))
+    metrics[4].metric("Active merged names", len(mapping_df))
+    st.caption(f"Total manual decisions saved across mappings: {len(st.session_state['manual_decisions'])}.")
 
     tabs = st.tabs(["1) Safe Auto-Merges", "2) Manual Review Queue", "3) Merge History + Undo", "4) Export"])
 
@@ -227,20 +234,6 @@ def app():
             if hide_reviewed_candidates and reviewed_auto_hidden_count > 0:
                 st.info("Some reviewed auto-groups are hidden. Turn off Hide reviewed candidates to inspect them.")
         else:
-            actions = st.columns(3)
-            if actions[0].button("Accept all safe auto-merges", use_container_width=True):
-                for gid in auto_groups_df["auto_group_key"].tolist():
-                    st.session_state["auto_status"][gid] = "accepted"
-                st.rerun()
-            if actions[1].button("Reject all safe auto-merges", use_container_width=True):
-                for gid in auto_groups_df["auto_group_key"].tolist():
-                    st.session_state["auto_status"][gid] = "rejected"
-                st.rerun()
-            if actions[2].button("Clear all auto decisions", use_container_width=True):
-                for gid in auto_groups_df["auto_group_key"].tolist():
-                    st.session_state["auto_status"].pop(gid, None)
-                st.rerun()
-
             idx = min(st.session_state["auto_index"], len(visible_auto_groups_df) - 1)
             st.session_state["auto_index"] = idx
             row = visible_auto_groups_df.iloc[idx]
@@ -253,25 +246,40 @@ def app():
             info[3].markdown(f"**Reason:** {row['reasons']}")
 
             nav = st.columns(5)
-            if nav[0].button("⬅️ Previous group", use_container_width=True):
+            if nav[0].button("Previous group", use_container_width=True):
                 st.session_state["auto_index"] = max(st.session_state["auto_index"] - 1, 0)
                 st.rerun()
-            if nav[1].button("✅ Accept auto-merge", use_container_width=True):
+            if nav[1].button("Accept", use_container_width=True):
                 st.session_state["auto_status"][row["auto_group_key"]] = "accepted"
                 if not hide_reviewed_candidates:
                     st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
                 st.rerun()
-            if nav[2].button("❌ Reject auto-merge", use_container_width=True):
+            if nav[2].button("Reject", use_container_width=True):
                 st.session_state["auto_status"][row["auto_group_key"]] = "rejected"
                 if not hide_reviewed_candidates:
                     st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
                 st.rerun()
-            if nav[3].button("↩️ Undo this auto decision", use_container_width=True):
+            if nav[3].button("Undo", use_container_width=True):
                 st.session_state["auto_status"].pop(row["auto_group_key"], None)
                 st.rerun()
-            if nav[4].button("➡️ Next group", use_container_width=True):
+            if nav[4].button("Next group", use_container_width=True):
                 st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
                 st.rerun()
+
+            with st.expander("Bulk actions", expanded=False):
+                actions = st.columns(3)
+                if actions[0].button("Accept all visible", use_container_width=True):
+                    for gid in visible_auto_groups_df["auto_group_key"].tolist():
+                        st.session_state["auto_status"][gid] = "accepted"
+                    st.rerun()
+                if actions[1].button("Reject all visible", use_container_width=True):
+                    for gid in visible_auto_groups_df["auto_group_key"].tolist():
+                        st.session_state["auto_status"][gid] = "rejected"
+                    st.rerun()
+                if actions[2].button("Clear all visible", use_container_width=True):
+                    for gid in visible_auto_groups_df["auto_group_key"].tolist():
+                        st.session_state["auto_status"].pop(gid, None)
+                    st.rerun()
 
             detail = st.columns(4)
             detail[0].metric("Member names", row["member_count"])
@@ -280,11 +288,12 @@ def app():
             detail[3].metric("Max year", row["max_year"] if pd.notna(row["max_year"]) else "—")
 
             st.markdown(f"**Members:** {row['member_names']}")
-            st.markdown(f"**Units:** {row['units'] or '—'}")
-            st.markdown(f"**Vessel types:** {row['vessel_types'] or '—'}")
+            st.markdown(f"**Reason:** {row['reasons']}")
+            st.markdown(f"**Year range:** {row['min_year'] if pd.notna(row['min_year']) else '—'} to {row['max_year'] if pd.notna(row['max_year']) else '—'}")
 
-            preview = auto_preview_df[["auto_group_id", "auto_group_key", "canonical_name", "member_count", "total_rows", "reasons", "status"]].copy()
-            st.dataframe(preview, use_container_width=True, hide_index=True)
+            with st.expander("Advanced: auto-group table", expanded=False):
+                preview = auto_preview_df[["auto_group_id", "auto_group_key", "canonical_name", "member_count", "total_rows", "reasons", "status"]].copy()
+                st.dataframe(preview, use_container_width=True, hide_index=True)
 
     with tabs[1]:
         st.subheader("Manual review queue")
@@ -314,39 +323,41 @@ def app():
             info[3].markdown(f"**Suggested canonical:** {row['suggested_canonical']}")
 
             nav = st.columns(6)
-            if nav[0].button("⬅️ Previous pair", use_container_width=True):
+            if nav[0].button("Previous pair", use_container_width=True):
                 st.session_state["pair_index"] = max(st.session_state["pair_index"] - 1, 0)
                 st.rerun()
-            if nav[1].button("✅ Merge", use_container_width=True):
+            if nav[1].button("Merge", use_container_width=True):
                 st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "merge", column_config["entity_column"])
                 if not hide_reviewed_candidates:
                     st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
-            if nav[2].button("❌ Keep separate", use_container_width=True):
+            if nav[2].button("Keep separate", use_container_width=True):
                 st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "keep_separate", column_config["entity_column"])
                 if not hide_reviewed_candidates:
                     st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
-            if nav[3].button("🤔 Unsure", use_container_width=True):
+            if nav[3].button("Unsure", use_container_width=True):
                 st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "unsure", column_config["entity_column"])
                 if not hide_reviewed_candidates:
                     st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
-            if nav[4].button("↩️ Undo this pair decision", use_container_width=True):
+            if nav[4].button("Undo", use_container_width=True):
                 st.session_state["manual_decisions"].pop(row["pair_key"], None)
                 st.rerun()
-            if nav[5].button("➡️ Next pair", use_container_width=True):
+            if nav[5].button("Next pair", use_container_width=True):
                 st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
 
-            st.markdown("#### Why this pair was flagged")
+            st.markdown("#### Why this candidate was flagged")
             st.write(row["reasons"])
 
             cols = st.columns(2)
             with cols[0]:
-                show_summary_card("Side A", {"raw_name": row["name_a"], **stat_lookup[row["name_a"]]})
+                st.markdown("**Name A**")
+                st.write(row["name_a"])
             with cols[1]:
-                show_summary_card("Side B", {"raw_name": row["name_b"], **stat_lookup[row["name_b"]]})
+                st.markdown("**Name B**")
+                st.write(row["name_b"])
 
             scores = st.columns(6)
             scores[0].metric("Raw name", f"{row['raw_name_score']:.3f}")
@@ -355,7 +366,7 @@ def app():
             scores[3].metric("Units", f"{row['unit_score']:.3f}")
             scores[4].metric("Type/category evidence", f"{row['type_score']:.3f}")
             scores[5].metric("Amount evidence", f"{row['cargo_amount_score']:.3f}")
-            st.caption("Cargo amount is weak supporting evidence, not registered vessel tonnage.")
+            st.caption("Evidence scores are support signals for reviewer decisions.")
 
             selected_cols = [column_config["entity_column"], column_config["year_column"], column_config["type_column"], column_config["amount_column"], column_config["unit_column"], column_config["notes_column_1"], column_config["notes_column_2"]]
             id_candidates = ["OID", "Volume", "Page", "Day", "Month", "Year", "Entry no."]
@@ -364,12 +375,9 @@ def app():
             left_rows = raw_df[raw_df[column_config["entity_column"]].fillna("").astype(str).str.strip() == row["name_a"]][display_columns].head(sample_rows)
             right_rows = raw_df[raw_df[column_config["entity_column"]].fillna("").astype(str).str.strip() == row["name_b"]][display_columns].head(sample_rows)
 
-            previews = st.columns(2)
-            with previews[0]:
-                st.markdown("#### Original rows for Side A")
+            with st.expander("Show original rows for Name A", expanded=False):
                 st.dataframe(left_rows, use_container_width=True, hide_index=True)
-            with previews[1]:
-                st.markdown("#### Original rows for Side B")
+            with st.expander("Show original rows for Name B", expanded=False):
                 st.dataframe(right_rows, use_container_width=True, hide_index=True)
 
     with tabs[2]:
@@ -394,7 +402,7 @@ def app():
 
     with tabs[3]:
         st.subheader("Export")
-        st.info("This exports a reviewed copy. The original uploaded workbook is not overwritten.")
+        st.info("Cleaned workbook: a reviewed Excel copy. The original uploaded workbook is never overwritten.")
         auto_export = auto_groups_df.copy()
         if not auto_export.empty:
             auto_export["status"] = auto_export["auto_group_key"].map(lambda gid: st.session_state["auto_status"].get(gid, "pending"))
@@ -404,52 +412,6 @@ def app():
         pair_export = pd.DataFrame(st.session_state["manual_decisions"].values())
         session_payload = build_session_payload(sheet_name, column_config)
         session_bytes = json.dumps(session_payload, indent=2).encode("utf-8")
-        uploaded_session = st.file_uploader("Upload review session JSON", type=["json"], key="session_upload")
-        if st.button("Load review session", use_container_width=False):
-            if uploaded_session is None:
-                st.warning("Please upload a review session JSON first.")
-            else:
-                data = json.loads(uploaded_session.getvalue().decode("utf-8"))
-                saved_cfg = data.get("column_config", {})
-                missing_cols = [v for v in saved_cfg.values() if v and v not in raw_df.columns]
-                if missing_cols:
-                    st.warning(f"Some saved columns are missing in the current sheet: {', '.join(sorted(set(missing_cols)))}. Using current mapping where needed.")
-                else:
-                    st.success("Loaded session column mapping.")
-                st.session_state["column_config"] = saved_cfg
-                mapping_to_widget = {
-                    "entity_column": "entity_column_select",
-                    "year_column": "year_column_select",
-                    "type_column": "type_column_select",
-                    "amount_column": "amount_column_select",
-                    "unit_column": "unit_column_select",
-                    "notes_column_1": "notes_column_1_select",
-                    "notes_column_2": "notes_column_2_select",
-                }
-                for cfg_key, widget_key in mapping_to_widget.items():
-                    value = saved_cfg.get(cfg_key)
-                    if cfg_key == "entity_column":
-                        fallback = default_entity
-                    else:
-                        fallback = "(None)"
-                    if value in available_cols:
-                        st.session_state[widget_key] = value
-                    else:
-                        st.session_state[widget_key] = fallback
-                st.session_state["auto_status"] = data.get("auto_status", {})
-                st.session_state["manual_decisions"] = data.get("manual_decisions", {})
-                st.session_state["auto_index"] = 0
-                st.session_state["pair_index"] = 0
-                st.success("Review session loaded.")
-                st.rerun()
-
-        buttons = st.columns(5)
-        buttons[0].download_button("Download review session JSON", session_bytes, "ship_review_session.json", "application/json", use_container_width=True)
-        buttons[1].download_button("Download auto-merge decisions CSV", make_download_bytes(auto_export if not auto_export.empty else pd.DataFrame()), "ship_auto_merge_decisions.csv", "text/csv", use_container_width=True)
-        buttons[2].download_button("Download manual review decisions CSV", make_download_bytes(pair_export if not pair_export.empty else pd.DataFrame()), "ship_manual_review_decisions.csv", "text/csv", use_container_width=True)
-        buttons[3].download_button("Download merge history CSV", make_download_bytes(history_df if not history_df.empty else pd.DataFrame()), "ship_merge_history.csv", "text/csv", use_container_width=True)
-        buttons[4].download_button("Download canonical mapping CSV", make_download_bytes(mapping_df if not mapping_df.empty else pd.DataFrame()), "ship_canonical_mapping.csv", "text/csv", use_container_width=True)
-
         base_name = getattr(uploaded, "name", "") or "cleaned_duplicate_review.xlsx"
         if base_name.lower().endswith(".xlsx"):
             cleaned_name = f"{base_name[:-5]}_reviewed.xlsx"
@@ -473,6 +435,50 @@ def app():
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
+
+        with st.expander("Continue later", expanded=False):
+            st.caption("Session JSON: saves review progress so you can continue later.")
+            uploaded_session = st.file_uploader("Upload review session JSON", type=["json"], key="session_upload")
+            if st.button("Load review session", use_container_width=False):
+                if uploaded_session is None:
+                    st.warning("Please upload a review session JSON first.")
+                else:
+                    data = json.loads(uploaded_session.getvalue().decode("utf-8"))
+                    saved_cfg = data.get("column_config", {})
+                    missing_cols = [v for v in saved_cfg.values() if v and v not in raw_df.columns]
+                    if missing_cols:
+                        st.warning(f"Some saved columns are missing in the current sheet: {', '.join(sorted(set(missing_cols)))}. Using current mapping where needed.")
+                    else:
+                        st.success("Loaded session column mapping.")
+                    st.session_state["column_config"] = saved_cfg
+                    mapping_to_widget = {
+                        "entity_column": "entity_column_select",
+                        "year_column": "year_column_select",
+                        "type_column": "type_column_select",
+                        "amount_column": "amount_column_select",
+                        "unit_column": "unit_column_select",
+                        "notes_column_1": "notes_column_1_select",
+                        "notes_column_2": "notes_column_2_select",
+                    }
+                    for cfg_key, widget_key in mapping_to_widget.items():
+                        value = saved_cfg.get(cfg_key)
+                        fallback = default_entity if cfg_key == "entity_column" else "(None)"
+                        st.session_state[widget_key] = value if value in available_cols else fallback
+                    st.session_state["auto_status"] = data.get("auto_status", {})
+                    st.session_state["manual_decisions"] = data.get("manual_decisions", {})
+                    st.session_state["auto_index"] = 0
+                    st.session_state["pair_index"] = 0
+                    st.success("Review session loaded.")
+                    st.rerun()
+            st.download_button("Download review session JSON", session_bytes, "ship_review_session.json", "application/json", use_container_width=True)
+
+        with st.expander("Audit exports", expanded=False):
+            st.caption("CSV exports: audit/debug logs for review decisions and merge outcomes.")
+            buttons = st.columns(4)
+            buttons[0].download_button("Auto-merge decisions CSV", make_download_bytes(auto_export if not auto_export.empty else pd.DataFrame()), "ship_auto_merge_decisions.csv", "text/csv", use_container_width=True)
+            buttons[1].download_button("Manual review decisions CSV", make_download_bytes(pair_export if not pair_export.empty else pd.DataFrame()), "ship_manual_review_decisions.csv", "text/csv", use_container_width=True)
+            buttons[2].download_button("Merge history CSV", make_download_bytes(history_df if not history_df.empty else pd.DataFrame()), "ship_merge_history.csv", "text/csv", use_container_width=True)
+            buttons[3].download_button("Canonical mapping CSV", make_download_bytes(mapping_df if not mapping_df.empty else pd.DataFrame()), "ship_canonical_mapping.csv", "text/csv", use_container_width=True)
 
 if __name__ == "__main__":
     app()
