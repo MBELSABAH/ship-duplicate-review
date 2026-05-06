@@ -27,3 +27,21 @@ python3 -m streamlit run app.py
 - Column mapping defaults still match the original ship workbook when those columns exist.
 - Session JSON includes column mapping config plus auto/manual decisions.
 - Cleaned Excel export is **not** implemented in this sprint.
+
+## Running the apps
+
+Streamlit app:
+
+```bash
+python3 -m streamlit run app.py
+```
+
+FastAPI backend:
+
+```bash
+python3 -m uvicorn api:app --reload
+```
+
+API docs:
+
+- http://127.0.0.1:8000/docs
