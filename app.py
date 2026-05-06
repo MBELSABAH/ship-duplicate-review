@@ -471,6 +471,14 @@ def resolved_names_from_auto(auto_groups_df, auto_status):
             resolved.update(row["members_list"])
     return resolved
 
+def active_manual_decisions_for_config(manual_decisions: dict, column_config: dict) -> dict:
+    active_entity = column_config["entity_column"]
+    return {
+        key: record
+        for key, record in manual_decisions.items()
+        if record.get("entity_column") == active_entity
+    }
+
 
 def init_state():
     defaults = {
@@ -634,7 +642,11 @@ def app():
     if not queue_df.empty:
         queue_df = queue_df[queue_df["score"] >= min_manual_score].reset_index(drop=True)
 
-    history_df, mapping_df = build_merge_outputs(stats_df, auto_groups_df, st.session_state["auto_status"], st.session_state["manual_decisions"])
+    active_manual_decisions = active_manual_decisions_for_config(st.session_state["manual_decisions"], column_config)
+    hidden_decision_count = len(st.session_state["manual_decisions"]) - len(active_manual_decisions)
+    if hidden_decision_count > 0:
+        st.info("Some saved decisions belong to a different primary column and are hidden from the current mapping.")
+    history_df, mapping_df = build_merge_outputs(stats_df, auto_groups_df, st.session_state["auto_status"], active_manual_decisions)
 
     stat_lookup = stats_df.set_index("raw_name").to_dict("index")
 
@@ -644,6 +656,7 @@ def app():
     metrics[2].metric("Accepted auto-groups", sum(1 for v in st.session_state["auto_status"].values() if v == "accepted"))
     metrics[3].metric("Manual queue", len(queue_df) if queue_df is not None else 0)
     metrics[4].metric("Merged names now", len(mapping_df))
+    st.caption(f"Manual decisions in current mapping: {len(active_manual_decisions)} (total saved: {len(st.session_state['manual_decisions'])}).")
 
     tabs = st.tabs(["1) Safe Auto-Merges", "2) Manual Review Queue", "3) Merge History + Undo", "4) Export"])
 
@@ -722,7 +735,7 @@ def app():
             idx = min(st.session_state["pair_index"], len(queue_df) - 1)
             st.session_state["pair_index"] = idx
             row = queue_df.iloc[idx]
-            decision = st.session_state["manual_decisions"].get(row["pair_key"], {}).get("decision", "unreviewed")
+            decision = active_manual_decisions.get(row["pair_key"], {}).get("decision", "unreviewed")
 
             info = st.columns([2, 1.5, 1.5, 2])
             info[0].markdown(f"### Candidate {idx + 1} / {len(queue_df)}")
