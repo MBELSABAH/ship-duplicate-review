@@ -193,13 +193,20 @@ def build_reason_list(name_score, same_clean, year_score, unit_score, type_score
 
 
 def choose_canonical_name(stats_df, name_list):
+    def canonical_sort_key(name: str):
+        compact = re.sub(r"[^A-Za-z0-9]", "", name)
+        all_caps = int(bool(compact) and compact.isupper())
+        punctuation_count = len(re.findall(r"[^\w\s]", name))
+        whitespace_normalized = re.sub(r"\s+", " ", name).strip()
+        return (all_caps, punctuation_count, len(whitespace_normalized), whitespace_normalized.lower())
+
     subset = stats_df[stats_df["raw_name"].isin(name_list)].copy()
     subset = subset.sort_values(["row_count", "raw_name"], ascending=[False, True])
     if subset.empty:
-        return sorted(name_list, key=lambda x: (len(x), x.lower()))[0]
+        return sorted(name_list, key=canonical_sort_key)[0]
     max_rows = subset["row_count"].max()
     candidates = subset[subset["row_count"] == max_rows]["raw_name"].tolist()
-    return sorted(candidates, key=lambda x: (len(x), x.lower()))[0]
+    return sorted(candidates, key=canonical_sort_key)[0]
 
 
 def preprocess_rows(df: pd.DataFrame, column_config: dict) -> pd.DataFrame:
@@ -792,8 +799,24 @@ def app():
         st.subheader("Safe auto-merges")
         st.write("These are the most conservative merges. They trigger only when names share the same strict key after removing punctuation, case, and spaces.")
 
-        if auto_groups_df.empty:
-            st.info("No safe auto-groups found.")
+        auto_preview_df = auto_groups_df.copy()
+        auto_preview_df["status"] = auto_preview_df["auto_group_key"].map(lambda gid: st.session_state["auto_status"].get(gid, "pending"))
+        if hide_reviewed_candidates:
+            visible_auto_groups_df = auto_preview_df[auto_preview_df["status"] == "pending"].reset_index(drop=True)
+        else:
+            visible_auto_groups_df = auto_preview_df.reset_index(drop=True)
+        reviewed_auto_hidden_count = len(auto_preview_df) - len(visible_auto_groups_df) if hide_reviewed_candidates else 0
+
+        st.caption(
+            f"Generated safe auto-groups: {len(auto_preview_df)} | "
+            f"Visible auto-groups: {len(visible_auto_groups_df)} | "
+            f"Reviewed auto-groups hidden: {reviewed_auto_hidden_count}"
+        )
+
+        if visible_auto_groups_df.empty:
+            st.info("No visible safe auto-groups under the current settings.")
+            if hide_reviewed_candidates and reviewed_auto_hidden_count > 0:
+                st.info("Some reviewed auto-groups are hidden. Turn off Hide reviewed candidates to inspect them.")
         else:
             actions = st.columns(3)
             if actions[0].button("Accept all safe auto-merges", use_container_width=True):
@@ -809,13 +832,13 @@ def app():
                     st.session_state["auto_status"].pop(gid, None)
                 st.rerun()
 
-            idx = min(st.session_state["auto_index"], len(auto_groups_df) - 1)
+            idx = min(st.session_state["auto_index"], len(visible_auto_groups_df) - 1)
             st.session_state["auto_index"] = idx
-            row = auto_groups_df.iloc[idx]
+            row = visible_auto_groups_df.iloc[idx]
             status = st.session_state["auto_status"].get(row["auto_group_key"], "pending")
 
             info = st.columns([2, 1.5, 1.5, 2])
-            info[0].markdown(f"### Group {idx + 1} / {len(auto_groups_df)}")
+            info[0].markdown(f"### Group {idx + 1} / {len(visible_auto_groups_df)}")
             info[1].markdown(f"**Status:** {status}")
             info[2].markdown(f"**Canonical:** {row['canonical_name']}")
             info[3].markdown(f"**Reason:** {row['reasons']}")
@@ -826,17 +849,19 @@ def app():
                 st.rerun()
             if nav[1].button("✅ Accept auto-merge", use_container_width=True):
                 st.session_state["auto_status"][row["auto_group_key"]] = "accepted"
-                st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(auto_groups_df) - 1)
+                if not hide_reviewed_candidates:
+                    st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
                 st.rerun()
             if nav[2].button("❌ Reject auto-merge", use_container_width=True):
                 st.session_state["auto_status"][row["auto_group_key"]] = "rejected"
-                st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(auto_groups_df) - 1)
+                if not hide_reviewed_candidates:
+                    st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
                 st.rerun()
             if nav[3].button("↩️ Undo this auto decision", use_container_width=True):
                 st.session_state["auto_status"].pop(row["auto_group_key"], None)
                 st.rerun()
             if nav[4].button("➡️ Next group", use_container_width=True):
-                st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(auto_groups_df) - 1)
+                st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
                 st.rerun()
 
             detail = st.columns(4)
@@ -849,8 +874,7 @@ def app():
             st.markdown(f"**Units:** {row['units'] or '—'}")
             st.markdown(f"**Vessel types:** {row['vessel_types'] or '—'}")
 
-            preview = auto_groups_df[["auto_group_id", "auto_group_key", "canonical_name", "member_count", "total_rows", "reasons"]].copy()
-            preview["status"] = preview["auto_group_key"].map(lambda gid: st.session_state["auto_status"].get(gid, "pending"))
+            preview = auto_preview_df[["auto_group_id", "auto_group_key", "canonical_name", "member_count", "total_rows", "reasons", "status"]].copy()
             st.dataframe(preview, use_container_width=True, hide_index=True)
 
     with tabs[1]:
