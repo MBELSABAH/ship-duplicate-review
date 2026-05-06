@@ -235,7 +235,7 @@ def app():
             if hide_reviewed_candidates and reviewed_auto_hidden_count > 0:
                 st.info("Some reviewed auto-groups are hidden. Turn off Hide reviewed candidates to inspect them.")
         else:
-            with st.expander("Bulk actions"):
+            with st.expander("Bulk actions", expanded=True):
                 actions = st.columns(3)
                 if actions[0].button("Accept all safe auto-merges", use_container_width=True, key="auto_bulk_accept"):
                     for gid in auto_groups_df["auto_group_key"].tolist():
@@ -372,10 +372,10 @@ def app():
 
             previews = st.columns(2)
             with previews[0]:
-                with st.expander("Original rows for Side A", expanded=False):
+                with st.expander("Original rows for Side A", expanded=True):
                     st.dataframe(left_rows, use_container_width=True, hide_index=True)
             with previews[1]:
-                with st.expander("Original rows for Side B", expanded=False):
+                with st.expander("Original rows for Side B", expanded=True):
                     st.dataframe(right_rows, use_container_width=True, hide_index=True)
 
     with tabs[2]:
@@ -470,10 +470,10 @@ def app():
         st.markdown("#### Primary export")
         st.download_button("Download cleaned workbook", cleaned_bytes, cleaned_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, key="download_cleaned_workbook")
         st.caption("Exports a reviewed copy of the workbook. The original uploaded file is not overwritten.")
-        st.markdown("#### Continue later")
-        session_actions = st.columns([1, 1.2])
-        session_actions[0].download_button("Download review session JSON", session_bytes, "ship_review_session.json", "application/json", use_container_width=True, key="download_review_session_json")
-        with st.expander("Audit exports"):
+        with st.expander("Continue later", expanded=True):
+            session_actions = st.columns([1, 1.2])
+            session_actions[0].download_button("Download review session JSON", session_bytes, "ship_review_session.json", "application/json", use_container_width=True, key="download_review_session_json")
+        with st.expander("Audit exports", expanded=True):
             st.download_button("auto decisions CSV", make_download_bytes(auto_export if not auto_export.empty else pd.DataFrame()), "ship_auto_merge_decisions.csv", "text/csv", use_container_width=True, key="download_auto_decisions_csv")
             st.download_button("manual decisions CSV", make_download_bytes(pair_export if not pair_export.empty else pd.DataFrame()), "ship_manual_review_decisions.csv", "text/csv", use_container_width=True, key="download_manual_decisions_csv")
             st.download_button("merge history CSV", make_download_bytes(history_df if not history_df.empty else pd.DataFrame()), "ship_merge_history.csv", "text/csv", use_container_width=True, key="download_merge_history_csv")
