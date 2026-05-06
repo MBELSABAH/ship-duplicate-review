@@ -1,27 +1,24 @@
-# Ship Duplicate Review MVP v2
+# Ship Duplicate Review MVP v3
 
-This Streamlit app adds three important safeguards:
+This Streamlit app includes Sprint 1 v3 features:
 
-1. **Safe auto-merges**
-   - conservative automatic merges for names that only differ by punctuation/case/spaces
-2. **Merge history**
-   - every currently active merge is listed with the reason it was merged
-3. **Undo**
-   - you can undo any active auto-merge or manual merge
+1. **Stable decisions**
+   - stable keys for auto groups and manual pair decisions
+2. **Session save/load**
+   - download review progress as JSON and reload it later
+3. **Safe workflow**
+   - original workbook is never overwritten
+4. **Exportable logs/mapping**
+   - export auto/manual decisions, merge history, and canonical mapping
 
 ## Install
 ```bash
-pip3 install pandas openpyxl rapidfuzz streamlit
+pip install -r requirements.txt
 ```
 
 ## Run
 ```bash
-streamlit run mvp_ship_human_review_v2.py
-```
-
-If `streamlit` is not found:
-```bash
-python3 -m streamlit run mvp_ship_human_review_v2.py
+python3 -m streamlit run app.py
 ```
 
 ## Workflow
