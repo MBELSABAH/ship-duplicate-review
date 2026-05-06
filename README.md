@@ -1,15 +1,6 @@
 # Ship Duplicate Review MVP v3
 
-This Streamlit app includes Sprint 1 v3 features:
-
-1. **Stable decisions**
-   - stable keys for auto groups and manual pair decisions
-2. **Session save/load**
-   - download review progress as JSON and reload it later
-3. **Safe workflow**
-   - original workbook is never overwritten
-4. **Exportable logs/mapping**
-   - export auto/manual decisions, merge history, and canonical mapping
+This Streamlit app now supports **generic Excel workbooks** via column mapping while preserving Sprint 1 stable decisions/session behavior.
 
 ## Install
 ```bash
@@ -22,16 +13,17 @@ python3 -m streamlit run app.py
 ```
 
 ## Workflow
-1. Upload workbook
-2. Review / accept safe auto-merges
-3. Review remaining manual candidates
-4. Check merge history
-5. Undo anything suspicious
-6. Export:
-   - auto-merge decisions
-   - manual review decisions
-   - merge history
-   - canonical mapping
+1. Upload workbook.
+2. Choose sheet.
+3. Choose a **primary deduplication column** (required).
+4. Choose optional evidence columns (year/date, type/category, amount, unit, notes).
+5. Review/accept safe auto-merges.
+6. Review remaining manual candidates.
+7. Save/load review session JSON.
+8. Export logs and canonical mapping CSV files.
 
-## Important
-This MVP does not overwrite the workbook directly. It exports the merge plan and logs so the process stays auditable.
+## Notes
+- Original workbook is never overwritten.
+- Column mapping defaults still match the original ship workbook when those columns exist.
+- Session JSON includes column mapping config plus auto/manual decisions.
+- Cleaned Excel export is **not** implemented in this sprint.

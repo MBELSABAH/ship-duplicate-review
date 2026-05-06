@@ -12,7 +12,16 @@ import streamlit as st
 from rapidfuzz import fuzz
 
 
-APP_TITLE = "Ship Duplicate Review MVP v2"
+APP_TITLE = "Duplicate Review MVP v3"
+SHIP_DEFAULTS = {
+    "entity_column": "Name of Vessel",
+    "year_column": "Year",
+    "type_column": "Type of Veseel",
+    "amount_column": "Amount (primary)",
+    "unit_column": "Unit (primary)",
+    "notes_column_1": "Remarks from ledger",
+    "notes_column_2": "Notes from transcriber",
+}
 
 
 def normalize_spaces(text: str) -> str:
@@ -40,8 +49,8 @@ def make_pair_key(name_a: str, name_b: str, entity_column: str = "Name of Vessel
     return "P" + stable_hash(raw_key)
 
 
-def make_auto_group_key(strict_key: str) -> str:
-    return "A" + stable_hash("auto::" + str(strict_key))
+def make_auto_group_key(strict_key: str, entity_column: str) -> str:
+    return "A" + stable_hash(f"auto::{entity_column}::{strict_key}")
 
 
 def strict_name_key(value: str) -> str:
@@ -193,20 +202,27 @@ def choose_canonical_name(stats_df, name_list):
     return sorted(candidates, key=lambda x: (len(x), x.lower()))[0]
 
 
-def preprocess_rows(df: pd.DataFrame) -> pd.DataFrame:
+def preprocess_rows(df: pd.DataFrame, column_config: dict) -> pd.DataFrame:
     out = df.copy()
-    out["raw_name"] = out["Name of Vessel"].fillna("").astype(str).map(lambda x: x.strip())
+    entity_col = column_config["entity_column"]
+    out["raw_name"] = out.get(entity_col, pd.Series("", index=out.index)).fillna("").astype(str).map(lambda x: x.strip())
     out = out[out["raw_name"] != ""].copy()
     out["clean_name"] = out["raw_name"].map(clean_name)
     out["strict_name_key"] = out["raw_name"].map(strict_name_key)
-    out["vessel_type_clean"] = out.get("Type of Veseel", pd.Series("", index=out.index)).map(clean_vessel_type)
-    out["unit_primary_clean"] = out.get("Unit (primary)", pd.Series("", index=out.index)).map(clean_unit)
-    out["amount_primary_num"] = out.get("Amount (primary)", pd.Series(None, index=out.index)).map(to_float)
-    out["year_num"] = pd.to_numeric(out.get("Year", pd.Series(None, index=out.index)), errors="coerce")
+    type_col = column_config.get("type_column")
+    unit_col = column_config.get("unit_column")
+    amount_col = column_config.get("amount_column")
+    year_col = column_config.get("year_column")
+    notes_col_1 = column_config.get("notes_column_1")
+    notes_col_2 = column_config.get("notes_column_2")
+    out["vessel_type_clean"] = out.get(type_col, pd.Series("", index=out.index)).map(clean_vessel_type) if type_col else ""
+    out["unit_primary_clean"] = out.get(unit_col, pd.Series("", index=out.index)).map(clean_unit) if unit_col else ""
+    out["amount_primary_num"] = out.get(amount_col, pd.Series(None, index=out.index)).map(to_float) if amount_col else None
+    out["year_num"] = pd.to_numeric(out.get(year_col, pd.Series(None, index=out.index)), errors="coerce") if year_col else None
     out["notes_combined"] = (
-        out.get("Remarks from ledger", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
+        out.get(notes_col_1, pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
         + " || "
-        + out.get("Notes from transcriber", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
+        + out.get(notes_col_2, pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
     ).str.strip(" |")
     return out
 
@@ -236,7 +252,7 @@ def build_name_stats(rows: pd.DataFrame) -> pd.DataFrame:
     return stats
 
 
-def build_safe_auto_groups(stats: pd.DataFrame) -> pd.DataFrame:
+def build_safe_auto_groups(stats: pd.DataFrame, entity_column: str) -> pd.DataFrame:
     groups = []
     for strict_key, grp in stats.groupby("strict_name_key", sort=False):
         if not strict_key or len(grp) < 2:
@@ -251,7 +267,7 @@ def build_safe_auto_groups(stats: pd.DataFrame) -> pd.DataFrame:
         groups.append(
             {
                 "auto_group_id": f"A{len(groups)+1:04d}",
-                "auto_group_key": make_auto_group_key(strict_key),
+                "auto_group_key": make_auto_group_key(strict_key, entity_column),
                 "strict_name_key": strict_key,
                 "canonical_name": canonical,
                 "member_count": len(grp),
@@ -272,7 +288,7 @@ def build_safe_auto_groups(stats: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def generate_candidate_pairs(stats: pd.DataFrame, resolved_names=None, fuzzy_threshold: int = 88) -> pd.DataFrame:
+def generate_candidate_pairs(stats: pd.DataFrame, entity_column: str, resolved_names=None, fuzzy_threshold: int = 88) -> pd.DataFrame:
     if resolved_names is None:
         resolved_names = set()
     candidate_stats = stats[~stats["raw_name"].isin(resolved_names)].copy()
@@ -335,7 +351,7 @@ def generate_candidate_pairs(stats: pd.DataFrame, resolved_names=None, fuzzy_thr
             + 0.08 * type_score
             + 0.05 * cargo_amount_score
         )
-        pair_key = make_pair_key(row_a["display_name"], row_b["display_name"], "Name of Vessel")
+        pair_key = make_pair_key(row_a["display_name"], row_b["display_name"], entity_column)
 
         candidate_records.append(
             {
@@ -455,6 +471,14 @@ def resolved_names_from_auto(auto_groups_df, auto_status):
             resolved.update(row["members_list"])
     return resolved
 
+def active_manual_decisions_for_config(manual_decisions: dict, column_config: dict) -> dict:
+    active_entity = column_config["entity_column"]
+    return {
+        key: record
+        for key, record in manual_decisions.items()
+        if record.get("entity_column") == active_entity
+    }
+
 
 def init_state():
     defaults = {
@@ -462,6 +486,7 @@ def init_state():
         "manual_decisions": {},
         "auto_index": 0,
         "pair_index": 0,
+        "column_config": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -477,12 +502,12 @@ def load_sheet_names(file_bytes: bytes):
 
 
 @st.cache_data(show_spinner=False)
-def build_base_data(file_bytes: bytes, sheet_name: str):
+def build_base_data(file_bytes: bytes, sheet_name: str, column_config: dict):
     bio = io.BytesIO(file_bytes)
     raw_df = pd.read_excel(bio, sheet_name=sheet_name)
-    rows_df = preprocess_rows(raw_df)
+    rows_df = preprocess_rows(raw_df, column_config)
     stats_df = build_name_stats(rows_df)
-    auto_groups_df = build_safe_auto_groups(stats_df)
+    auto_groups_df = build_safe_auto_groups(stats_df, column_config["entity_column"])
     return raw_df, rows_df, stats_df, auto_groups_df
 
 
@@ -494,10 +519,10 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def build_manual_decision_record(row: pd.Series, decision: str):
+def build_manual_decision_record(row: pd.Series, decision: str, entity_column: str):
     return {
         "pair_key": row["pair_key"],
-        "entity_column": "Name of Vessel",
+        "entity_column": entity_column,
         "name_a": row["name_a"],
         "name_b": row["name_b"],
         "decision": decision,
@@ -514,12 +539,12 @@ def build_manual_decision_record(row: pd.Series, decision: str):
     }
 
 
-def build_session_payload(sheet_name: str):
+def build_session_payload(sheet_name: str, column_config: dict):
     return {
         "app_version": "v3-stable-decisions-session",
         "saved_at": now_iso(),
         "sheet_name": sheet_name,
-        "entity_column": "Name of Vessel",
+        "column_config": column_config,
         "auto_status": st.session_state.get("auto_status", {}),
         "manual_decisions": st.session_state.get("manual_decisions", {}),
     }
@@ -527,11 +552,11 @@ def build_session_payload(sheet_name: str):
 
 def show_summary_card(title: str, data: dict):
     st.markdown(f"### {title}")
-    st.markdown(f"**Raw name:** {data.get('raw_name', '')}")
-    st.markdown(f"**Cleaned name:** `{data.get('clean_name', '')}`")
+    st.markdown(f"**Primary value:** {data.get('raw_name', '')}")
+    st.markdown(f"**Cleaned value:** `{data.get('clean_name', '')}`")
     st.markdown(f"**Rows:** {data.get('row_count', 0)}")
     st.markdown(f"**Years:** {data.get('min_year', '')} → {data.get('max_year', '')}")
-    st.markdown(f"**Vessel types:** {set_to_text(data.get('vessel_types', [])) or '—'}")
+    st.markdown(f"**Type/category evidence:** {set_to_text(data.get('vessel_types', [])) or '—'}")
     st.markdown(f"**Units:** {set_to_text(data.get('units', [])) or '—'}")
     median_tons = data.get("median_tons")
     st.markdown(f"**Median cargo amount when unit=tons:** {median_tons if median_tons is not None else '—'}")
@@ -569,23 +594,69 @@ def app():
     with st.sidebar:
         sheet_name = st.selectbox("Sheet", sheet_names, index=0)
 
-    raw_df, rows_df, stats_df, auto_groups_df = build_base_data(file_bytes, sheet_name)
+    raw_df_preview = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, nrows=50)
+    available_cols = raw_df_preview.columns.tolist()
+    text_candidates = [c for c in available_cols if raw_df_preview[c].dtype == "object"]
+    default_entity = SHIP_DEFAULTS["entity_column"] if SHIP_DEFAULTS["entity_column"] in available_cols else (text_candidates[0] if text_candidates else available_cols[0])
+
+    saved_config = st.session_state.get("column_config", {}) or {}
+    with st.sidebar:
+        st.header("Column mapping")
+        entity_default = saved_config.get("entity_column") if saved_config.get("entity_column") in available_cols else default_entity
+        entity_column = st.selectbox("Primary column to deduplicate/review", available_cols, index=available_cols.index(entity_default), key="entity_column_select")
+        optional_options = ["(None)"] + available_cols
+        def optional_select(label, cfg_key, widget_key):
+            from_saved = saved_config.get(cfg_key)
+            if from_saved in available_cols:
+                default_val = from_saved
+            else:
+                default_val = SHIP_DEFAULTS[cfg_key] if SHIP_DEFAULTS[cfg_key] in available_cols else "(None)"
+            return st.selectbox(label, optional_options, index=optional_options.index(default_val), key=widget_key)
+        year_column = optional_select("Year/date column (optional)", "year_column", "year_column_select")
+        type_column = optional_select("Type/category column (optional)", "type_column", "type_column_select")
+        amount_column = optional_select("Amount column (optional)", "amount_column", "amount_column_select")
+        unit_column = optional_select("Unit column (optional)", "unit_column", "unit_column_select")
+        notes_column_1 = optional_select("Remarks/notes column 1 (optional)", "notes_column_1", "notes_column_1_select")
+        notes_column_2 = optional_select("Remarks/notes column 2 (optional)", "notes_column_2", "notes_column_2_select")
+
+    def none_if_placeholder(v):
+        return None if v == "(None)" else v
+    column_config = {
+        "entity_column": entity_column,
+        "year_column": none_if_placeholder(year_column),
+        "type_column": none_if_placeholder(type_column),
+        "amount_column": none_if_placeholder(amount_column),
+        "unit_column": none_if_placeholder(unit_column),
+        "notes_column_1": none_if_placeholder(notes_column_1),
+        "notes_column_2": none_if_placeholder(notes_column_2),
+    }
+    st.session_state["column_config"] = column_config
+
+    raw_df, rows_df, stats_df, auto_groups_df = build_base_data(file_bytes, sheet_name, column_config)
+
+    if pd.api.types.is_numeric_dtype(raw_df[column_config["entity_column"]]):
+        st.warning("This column looks numeric. The tool works best for text/entity columns such as names, places, categories, or labels.")
 
     resolved_names = resolved_names_from_auto(auto_groups_df, st.session_state["auto_status"])
-    queue_df = generate_candidate_pairs(stats_df, resolved_names=resolved_names, fuzzy_threshold=fuzzy_threshold)
+    queue_df = generate_candidate_pairs(stats_df, entity_column=column_config["entity_column"], resolved_names=resolved_names, fuzzy_threshold=fuzzy_threshold)
     if not queue_df.empty:
         queue_df = queue_df[queue_df["score"] >= min_manual_score].reset_index(drop=True)
 
-    history_df, mapping_df = build_merge_outputs(stats_df, auto_groups_df, st.session_state["auto_status"], st.session_state["manual_decisions"])
+    active_manual_decisions = active_manual_decisions_for_config(st.session_state["manual_decisions"], column_config)
+    hidden_decision_count = len(st.session_state["manual_decisions"]) - len(active_manual_decisions)
+    if hidden_decision_count > 0:
+        st.info("Some saved decisions belong to a different primary column and are hidden from the current mapping.")
+    history_df, mapping_df = build_merge_outputs(stats_df, auto_groups_df, st.session_state["auto_status"], active_manual_decisions)
 
     stat_lookup = stats_df.set_index("raw_name").to_dict("index")
 
     metrics = st.columns(5)
-    metrics[0].metric("Unique raw vessel names", len(stats_df))
+    metrics[0].metric("Unique raw primary values", len(stats_df))
     metrics[1].metric("Safe auto-groups", len(auto_groups_df))
     metrics[2].metric("Accepted auto-groups", sum(1 for v in st.session_state["auto_status"].values() if v == "accepted"))
     metrics[3].metric("Manual queue", len(queue_df) if queue_df is not None else 0)
     metrics[4].metric("Merged names now", len(mapping_df))
+    st.caption(f"Manual decisions in current mapping: {len(active_manual_decisions)} (total saved: {len(st.session_state['manual_decisions'])}).")
 
     tabs = st.tabs(["1) Safe Auto-Merges", "2) Manual Review Queue", "3) Merge History + Undo", "4) Export"])
 
@@ -664,7 +735,7 @@ def app():
             idx = min(st.session_state["pair_index"], len(queue_df) - 1)
             st.session_state["pair_index"] = idx
             row = queue_df.iloc[idx]
-            decision = st.session_state["manual_decisions"].get(row["pair_key"], {}).get("decision", "unreviewed")
+            decision = active_manual_decisions.get(row["pair_key"], {}).get("decision", "unreviewed")
 
             info = st.columns([2, 1.5, 1.5, 2])
             info[0].markdown(f"### Candidate {idx + 1} / {len(queue_df)}")
@@ -677,15 +748,15 @@ def app():
                 st.session_state["pair_index"] = max(st.session_state["pair_index"] - 1, 0)
                 st.rerun()
             if nav[1].button("✅ Merge", use_container_width=True):
-                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "merge")
+                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "merge", column_config["entity_column"])
                 st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(queue_df) - 1)
                 st.rerun()
             if nav[2].button("❌ Keep separate", use_container_width=True):
-                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "keep_separate")
+                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "keep_separate", column_config["entity_column"])
                 st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(queue_df) - 1)
                 st.rerun()
             if nav[3].button("🤔 Unsure", use_container_width=True):
-                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "unsure")
+                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "unsure", column_config["entity_column"])
                 st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(queue_df) - 1)
                 st.rerun()
             if nav[4].button("↩️ Undo this pair decision", use_container_width=True):
@@ -709,27 +780,23 @@ def app():
             scores[1].metric("Clean name", f"{row['clean_name_score']:.3f}")
             scores[2].metric("Years", f"{row['year_score']:.3f}")
             scores[3].metric("Units", f"{row['unit_score']:.3f}")
-            scores[4].metric("Vessel type", f"{row['type_score']:.3f}")
-            scores[5].metric("Cargo evidence", f"{row['cargo_amount_score']:.3f}")
+            scores[4].metric("Type/category evidence", f"{row['type_score']:.3f}")
+            scores[5].metric("Amount evidence", f"{row['cargo_amount_score']:.3f}")
             st.caption("Cargo amount is weak supporting evidence, not registered vessel tonnage.")
 
-            display_columns = [
-                "OID", "Volume", "Page", "Day", "Month", "Year", "Entry no.",
-                "Type of Veseel", "Name of Vessel", "Type of Commodity",
-                "Amount (primary)", "Unit (primary)", "Amount (secondary)", "Unit (secondary)",
-                "Remarks from ledger", "Notes from transcriber"
-            ]
-            display_columns = [c for c in display_columns if c in raw_df.columns]
-
-            left_rows = raw_df[raw_df["Name of Vessel"].fillna("").astype(str).str.strip() == row["name_a"]][display_columns].head(sample_rows)
-            right_rows = raw_df[raw_df["Name of Vessel"].fillna("").astype(str).str.strip() == row["name_b"]][display_columns].head(sample_rows)
+            selected_cols = [column_config["entity_column"], column_config["year_column"], column_config["type_column"], column_config["amount_column"], column_config["unit_column"], column_config["notes_column_1"], column_config["notes_column_2"]]
+            id_candidates = ["OID", "Volume", "Page", "Day", "Month", "Year", "Entry no."]
+            display_columns = [c for c in selected_cols + id_candidates if c and c in raw_df.columns]
+            display_columns = list(dict.fromkeys(display_columns))
+            left_rows = raw_df[raw_df[column_config["entity_column"]].fillna("").astype(str).str.strip() == row["name_a"]][display_columns].head(sample_rows)
+            right_rows = raw_df[raw_df[column_config["entity_column"]].fillna("").astype(str).str.strip() == row["name_b"]][display_columns].head(sample_rows)
 
             previews = st.columns(2)
             with previews[0]:
-                st.markdown("#### Sample original rows — Side A")
+                st.markdown("#### Original rows for Side A")
                 st.dataframe(left_rows, use_container_width=True, hide_index=True)
             with previews[1]:
-                st.markdown("#### Sample original rows — Side B")
+                st.markdown("#### Original rows for Side B")
                 st.dataframe(right_rows, use_container_width=True, hide_index=True)
 
     with tabs[2]:
@@ -757,9 +824,11 @@ def app():
         auto_export = auto_groups_df.copy()
         if not auto_export.empty:
             auto_export["status"] = auto_export["auto_group_key"].map(lambda gid: st.session_state["auto_status"].get(gid, "pending"))
+            auto_export["entity_column"] = column_config["entity_column"]
+            auto_export["members"] = auto_export["members_list"].map(lambda x: " | ".join(x))
             auto_export["members_list"] = auto_export["members_list"].map(lambda x: " | ".join(x))
         pair_export = pd.DataFrame(st.session_state["manual_decisions"].values())
-        session_payload = build_session_payload(sheet_name)
+        session_payload = build_session_payload(sheet_name, column_config)
         session_bytes = json.dumps(session_payload, indent=2).encode("utf-8")
         uploaded_session = st.file_uploader("Upload review session JSON", type=["json"], key="session_upload")
         if st.button("Load review session", use_container_width=False):
@@ -767,6 +836,32 @@ def app():
                 st.warning("Please upload a review session JSON first.")
             else:
                 data = json.loads(uploaded_session.getvalue().decode("utf-8"))
+                saved_cfg = data.get("column_config", {})
+                missing_cols = [v for v in saved_cfg.values() if v and v not in raw_df.columns]
+                if missing_cols:
+                    st.warning(f"Some saved columns are missing in the current sheet: {', '.join(sorted(set(missing_cols)))}. Using current mapping where needed.")
+                else:
+                    st.success("Loaded session column mapping.")
+                st.session_state["column_config"] = saved_cfg
+                mapping_to_widget = {
+                    "entity_column": "entity_column_select",
+                    "year_column": "year_column_select",
+                    "type_column": "type_column_select",
+                    "amount_column": "amount_column_select",
+                    "unit_column": "unit_column_select",
+                    "notes_column_1": "notes_column_1_select",
+                    "notes_column_2": "notes_column_2_select",
+                }
+                for cfg_key, widget_key in mapping_to_widget.items():
+                    value = saved_cfg.get(cfg_key)
+                    if cfg_key == "entity_column":
+                        fallback = default_entity
+                    else:
+                        fallback = "(None)"
+                    if value in available_cols:
+                        st.session_state[widget_key] = value
+                    else:
+                        st.session_state[widget_key] = fallback
                 st.session_state["auto_status"] = data.get("auto_status", {})
                 st.session_state["manual_decisions"] = data.get("manual_decisions", {})
                 st.session_state["auto_index"] = 0
