@@ -1,8 +1,11 @@
 
 import io
+import json
 import re
 import itertools
+import hashlib
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
@@ -25,6 +28,20 @@ def clean_name(value: str) -> str:
     s = re.sub(r"[\.,;:'\"`´‘’“”()\[\]{}_/\\|-]+", " ", s)
     s = normalize_spaces(s)
     return s
+
+
+def stable_hash(text: str, length: int = 12) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:length]
+
+
+def make_pair_key(name_a: str, name_b: str, entity_column: str = "Name of Vessel") -> str:
+    normalized_names = sorted([clean_name(name_a), clean_name(name_b)])
+    raw_key = entity_column + "::" + "||".join(normalized_names)
+    return "P" + stable_hash(raw_key)
+
+
+def make_auto_group_key(strict_key: str) -> str:
+    return "A" + stable_hash("auto::" + str(strict_key))
 
 
 def strict_name_key(value: str) -> str:
@@ -145,7 +162,7 @@ def tons_similarity(a_value, b_value):
     return 0.0
 
 
-def build_reason_list(name_score, same_clean, year_score, unit_score, type_score, ton_score):
+def build_reason_list(name_score, same_clean, year_score, unit_score, type_score, cargo_amount_score):
     reasons = []
     if same_clean:
         reasons.append("same cleaned name")
@@ -157,7 +174,7 @@ def build_reason_list(name_score, same_clean, year_score, unit_score, type_score
         reasons.append("shared cargo unit")
     if type_score == 1.0:
         reasons.append("shared vessel type")
-    if ton_score >= 0.8:
+    if cargo_amount_score >= 0.8:
         reasons.append("similar typical cargo amount")
     if year_score >= 0.8:
         reasons.append("overlapping/near years")
@@ -234,6 +251,7 @@ def build_safe_auto_groups(stats: pd.DataFrame) -> pd.DataFrame:
         groups.append(
             {
                 "auto_group_id": f"A{len(groups)+1:04d}",
+                "auto_group_key": make_auto_group_key(strict_key),
                 "strict_name_key": strict_key,
                 "canonical_name": canonical,
                 "member_count": len(grp),
@@ -307,7 +325,7 @@ def generate_candidate_pairs(stats: pd.DataFrame, resolved_names=None, fuzzy_thr
         year_score = year_overlap_score(row_a["min_year"], row_a["max_year"], row_b["min_year"], row_b["max_year"])
         unit_score = overlap_score(row_a["units"], row_b["units"])
         type_score = overlap_score(row_a["vessel_types"], row_b["vessel_types"])
-        ton_score = tons_similarity(row_a["median_tons"], row_b["median_tons"])
+        cargo_amount_score = tons_similarity(row_a["median_tons"], row_b["median_tons"])
 
         final_score = (
             0.45 * max(raw_score, clean_score)
@@ -315,12 +333,14 @@ def generate_candidate_pairs(stats: pd.DataFrame, resolved_names=None, fuzzy_thr
             + 0.12 * unit_score
             + 0.10 * year_score
             + 0.08 * type_score
-            + 0.05 * ton_score
+            + 0.05 * cargo_amount_score
         )
+        pair_key = make_pair_key(row_a["display_name"], row_b["display_name"], "Name of Vessel")
 
         candidate_records.append(
             {
-                "candidate_id": f"C{len(candidate_records)+1:05d}",
+                "pair_key": pair_key,
+                "candidate_id": pair_key,
                 "name_a": row_a["display_name"],
                 "name_b": row_b["display_name"],
                 "score": round(final_score, 4),
@@ -329,8 +349,8 @@ def generate_candidate_pairs(stats: pd.DataFrame, resolved_names=None, fuzzy_thr
                 "year_score": round(year_score, 4),
                 "unit_score": round(unit_score, 4),
                 "type_score": round(type_score, 4),
-                "tons_score": round(ton_score, 4),
-                "reasons": " | ".join(build_reason_list(max(raw_score, clean_score), same_clean, year_score, unit_score, type_score, ton_score)),
+                "cargo_amount_score": round(cargo_amount_score, 4),
+                "reasons": " | ".join(build_reason_list(max(raw_score, clean_score), same_clean, year_score, unit_score, type_score, cargo_amount_score)),
                 "suggested_canonical": choose_canonical_name(candidate_stats, [row_a["display_name"], row_b["display_name"]]),
             }
         )
@@ -359,13 +379,13 @@ class UnionFind:
             self.parent[rb] = ra
 
 
-def build_merge_outputs(stats_df, auto_groups_df, auto_status, pair_decisions, queue_df):
+def build_merge_outputs(stats_df, auto_groups_df, auto_status, manual_decisions):
     uf = UnionFind()
     history_records = []
 
     if not auto_groups_df.empty:
         for _, row in auto_groups_df.iterrows():
-            gid = row["auto_group_id"]
+            gid = row["auto_group_key"]
             if auto_status.get(gid) == "accepted":
                 members = row["members_list"]
                 for m in members[1:]:
@@ -381,16 +401,14 @@ def build_merge_outputs(stats_df, auto_groups_df, auto_status, pair_decisions, q
                     }
                 )
 
-    if not queue_df.empty:
-        q_lookup = queue_df.set_index("candidate_id").to_dict("index")
-        for cid, decision in pair_decisions.items():
-            if decision == "merge" and cid in q_lookup:
-                row = q_lookup[cid]
+    if manual_decisions:
+        for pair_key, row in manual_decisions.items():
+            if row.get("decision") == "merge":
                 uf.union(row["name_a"], row["name_b"])
                 history_records.append(
                     {
                         "merge_source": "manual_pair",
-                        "merge_id": cid,
+                        "merge_id": pair_key,
                         "canonical_name": row["suggested_canonical"],
                         "members": f"{row['name_a']} | {row['name_b']}",
                         "reason": row["reasons"],
@@ -433,7 +451,7 @@ def resolved_names_from_auto(auto_groups_df, auto_status):
     if auto_groups_df.empty:
         return resolved
     for _, row in auto_groups_df.iterrows():
-        if auto_status.get(row["auto_group_id"]) == "accepted":
+        if auto_status.get(row["auto_group_key"]) == "accepted":
             resolved.update(row["members_list"])
     return resolved
 
@@ -441,13 +459,15 @@ def resolved_names_from_auto(auto_groups_df, auto_status):
 def init_state():
     defaults = {
         "auto_status": {},
-        "pair_decisions": {},
+        "manual_decisions": {},
         "auto_index": 0,
         "pair_index": 0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+    if "pair_decisions" in st.session_state and st.session_state["pair_decisions"] and not st.session_state["manual_decisions"]:
+        st.session_state["manual_decisions"] = {}
 
 
 @st.cache_data(show_spinner=False)
@@ -468,6 +488,41 @@ def build_base_data(file_bytes: bytes, sheet_name: str):
 
 def make_download_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def build_manual_decision_record(row: pd.Series, decision: str):
+    return {
+        "pair_key": row["pair_key"],
+        "entity_column": "Name of Vessel",
+        "name_a": row["name_a"],
+        "name_b": row["name_b"],
+        "decision": decision,
+        "score": float(row["score"]),
+        "raw_name_score": float(row["raw_name_score"]),
+        "clean_name_score": float(row["clean_name_score"]),
+        "year_score": float(row["year_score"]),
+        "unit_score": float(row["unit_score"]),
+        "type_score": float(row["type_score"]),
+        "cargo_amount_score": float(row["cargo_amount_score"]),
+        "reasons": row["reasons"],
+        "suggested_canonical": row["suggested_canonical"],
+        "updated_at": now_iso(),
+    }
+
+
+def build_session_payload(sheet_name: str):
+    return {
+        "app_version": "v3-stable-decisions-session",
+        "saved_at": now_iso(),
+        "sheet_name": sheet_name,
+        "entity_column": "Name of Vessel",
+        "auto_status": st.session_state.get("auto_status", {}),
+        "manual_decisions": st.session_state.get("manual_decisions", {}),
+    }
 
 
 def show_summary_card(title: str, data: dict):
@@ -499,7 +554,7 @@ def app():
         sample_rows = st.slider("Sample original rows per side", 3, 12, 5, 1)
         if st.button("Reset all decisions", use_container_width=True):
             st.session_state["auto_status"] = {}
-            st.session_state["pair_decisions"] = {}
+            st.session_state["manual_decisions"] = {}
             st.session_state["auto_index"] = 0
             st.session_state["pair_index"] = 0
             st.rerun()
@@ -521,9 +576,7 @@ def app():
     if not queue_df.empty:
         queue_df = queue_df[queue_df["score"] >= min_manual_score].reset_index(drop=True)
 
-    history_df, mapping_df = build_merge_outputs(
-        stats_df, auto_groups_df, st.session_state["auto_status"], st.session_state["pair_decisions"], queue_df if queue_df is not None else pd.DataFrame()
-    )
+    history_df, mapping_df = build_merge_outputs(stats_df, auto_groups_df, st.session_state["auto_status"], st.session_state["manual_decisions"])
 
     stat_lookup = stats_df.set_index("raw_name").to_dict("index")
 
@@ -545,22 +598,22 @@ def app():
         else:
             actions = st.columns(3)
             if actions[0].button("Accept all safe auto-merges", use_container_width=True):
-                for gid in auto_groups_df["auto_group_id"].tolist():
+                for gid in auto_groups_df["auto_group_key"].tolist():
                     st.session_state["auto_status"][gid] = "accepted"
                 st.rerun()
             if actions[1].button("Reject all safe auto-merges", use_container_width=True):
-                for gid in auto_groups_df["auto_group_id"].tolist():
+                for gid in auto_groups_df["auto_group_key"].tolist():
                     st.session_state["auto_status"][gid] = "rejected"
                 st.rerun()
             if actions[2].button("Clear all auto decisions", use_container_width=True):
-                for gid in auto_groups_df["auto_group_id"].tolist():
+                for gid in auto_groups_df["auto_group_key"].tolist():
                     st.session_state["auto_status"].pop(gid, None)
                 st.rerun()
 
             idx = min(st.session_state["auto_index"], len(auto_groups_df) - 1)
             st.session_state["auto_index"] = idx
             row = auto_groups_df.iloc[idx]
-            status = st.session_state["auto_status"].get(row["auto_group_id"], "pending")
+            status = st.session_state["auto_status"].get(row["auto_group_key"], "pending")
 
             info = st.columns([2, 1.5, 1.5, 2])
             info[0].markdown(f"### Group {idx + 1} / {len(auto_groups_df)}")
@@ -573,15 +626,15 @@ def app():
                 st.session_state["auto_index"] = max(st.session_state["auto_index"] - 1, 0)
                 st.rerun()
             if nav[1].button("✅ Accept auto-merge", use_container_width=True):
-                st.session_state["auto_status"][row["auto_group_id"]] = "accepted"
+                st.session_state["auto_status"][row["auto_group_key"]] = "accepted"
                 st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(auto_groups_df) - 1)
                 st.rerun()
             if nav[2].button("❌ Reject auto-merge", use_container_width=True):
-                st.session_state["auto_status"][row["auto_group_id"]] = "rejected"
+                st.session_state["auto_status"][row["auto_group_key"]] = "rejected"
                 st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(auto_groups_df) - 1)
                 st.rerun()
             if nav[3].button("↩️ Undo this auto decision", use_container_width=True):
-                st.session_state["auto_status"].pop(row["auto_group_id"], None)
+                st.session_state["auto_status"].pop(row["auto_group_key"], None)
                 st.rerun()
             if nav[4].button("➡️ Next group", use_container_width=True):
                 st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(auto_groups_df) - 1)
@@ -597,8 +650,8 @@ def app():
             st.markdown(f"**Units:** {row['units'] or '—'}")
             st.markdown(f"**Vessel types:** {row['vessel_types'] or '—'}")
 
-            preview = auto_groups_df[["auto_group_id", "canonical_name", "member_count", "total_rows", "reasons"]].copy()
-            preview["status"] = preview["auto_group_id"].map(lambda gid: st.session_state["auto_status"].get(gid, "pending"))
+            preview = auto_groups_df[["auto_group_id", "auto_group_key", "canonical_name", "member_count", "total_rows", "reasons"]].copy()
+            preview["status"] = preview["auto_group_key"].map(lambda gid: st.session_state["auto_status"].get(gid, "pending"))
             st.dataframe(preview, use_container_width=True, hide_index=True)
 
     with tabs[1]:
@@ -611,7 +664,7 @@ def app():
             idx = min(st.session_state["pair_index"], len(queue_df) - 1)
             st.session_state["pair_index"] = idx
             row = queue_df.iloc[idx]
-            decision = st.session_state["pair_decisions"].get(row["candidate_id"], "unreviewed")
+            decision = st.session_state["manual_decisions"].get(row["pair_key"], {}).get("decision", "unreviewed")
 
             info = st.columns([2, 1.5, 1.5, 2])
             info[0].markdown(f"### Candidate {idx + 1} / {len(queue_df)}")
@@ -624,19 +677,19 @@ def app():
                 st.session_state["pair_index"] = max(st.session_state["pair_index"] - 1, 0)
                 st.rerun()
             if nav[1].button("✅ Merge", use_container_width=True):
-                st.session_state["pair_decisions"][row["candidate_id"]] = "merge"
+                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "merge")
                 st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(queue_df) - 1)
                 st.rerun()
             if nav[2].button("❌ Keep separate", use_container_width=True):
-                st.session_state["pair_decisions"][row["candidate_id"]] = "keep_separate"
+                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "keep_separate")
                 st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(queue_df) - 1)
                 st.rerun()
             if nav[3].button("🤔 Unsure", use_container_width=True):
-                st.session_state["pair_decisions"][row["candidate_id"]] = "unsure"
+                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "unsure")
                 st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(queue_df) - 1)
                 st.rerun()
             if nav[4].button("↩️ Undo this pair decision", use_container_width=True):
-                st.session_state["pair_decisions"].pop(row["candidate_id"], None)
+                st.session_state["manual_decisions"].pop(row["pair_key"], None)
                 st.rerun()
             if nav[5].button("➡️ Next pair", use_container_width=True):
                 st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(queue_df) - 1)
@@ -657,7 +710,8 @@ def app():
             scores[2].metric("Years", f"{row['year_score']:.3f}")
             scores[3].metric("Units", f"{row['unit_score']:.3f}")
             scores[4].metric("Vessel type", f"{row['type_score']:.3f}")
-            scores[5].metric("Cargo amount", f"{row['tons_score']:.3f}")
+            scores[5].metric("Cargo evidence", f"{row['cargo_amount_score']:.3f}")
+            st.caption("Cargo amount is weak supporting evidence, not registered vessel tonnage.")
 
             display_columns = [
                 "OID", "Volume", "Page", "Day", "Month", "Year", "Entry no.",
@@ -692,7 +746,7 @@ def app():
                 if selected["merge_source"] == "auto_group":
                     st.session_state["auto_status"].pop(selected_merge, None)
                 else:
-                    st.session_state["pair_decisions"].pop(selected_merge, None)
+                    st.session_state["manual_decisions"].pop(selected_merge, None)
                 st.rerun()
 
             st.markdown("#### Current canonical mapping")
@@ -702,17 +756,30 @@ def app():
         st.subheader("Export")
         auto_export = auto_groups_df.copy()
         if not auto_export.empty:
-            auto_export["status"] = auto_export["auto_group_id"].map(lambda gid: st.session_state["auto_status"].get(gid, "pending"))
+            auto_export["status"] = auto_export["auto_group_key"].map(lambda gid: st.session_state["auto_status"].get(gid, "pending"))
             auto_export["members_list"] = auto_export["members_list"].map(lambda x: " | ".join(x))
-        pair_export = queue_df.copy() if queue_df is not None else pd.DataFrame()
-        if not pair_export.empty:
-            pair_export["decision"] = pair_export["candidate_id"].map(lambda cid: st.session_state["pair_decisions"].get(cid, "unreviewed"))
+        pair_export = pd.DataFrame(st.session_state["manual_decisions"].values())
+        session_payload = build_session_payload(sheet_name)
+        session_bytes = json.dumps(session_payload, indent=2).encode("utf-8")
+        uploaded_session = st.file_uploader("Upload review session JSON", type=["json"], key="session_upload")
+        if st.button("Load review session", use_container_width=False):
+            if uploaded_session is None:
+                st.warning("Please upload a review session JSON first.")
+            else:
+                data = json.loads(uploaded_session.getvalue().decode("utf-8"))
+                st.session_state["auto_status"] = data.get("auto_status", {})
+                st.session_state["manual_decisions"] = data.get("manual_decisions", {})
+                st.session_state["auto_index"] = 0
+                st.session_state["pair_index"] = 0
+                st.success("Review session loaded.")
+                st.rerun()
 
-        buttons = st.columns(4)
-        buttons[0].download_button("Download auto-merge decisions CSV", make_download_bytes(auto_export if not auto_export.empty else pd.DataFrame()), "ship_auto_merge_decisions.csv", "text/csv", use_container_width=True)
-        buttons[1].download_button("Download manual review decisions CSV", make_download_bytes(pair_export if not pair_export.empty else pd.DataFrame()), "ship_manual_review_decisions.csv", "text/csv", use_container_width=True)
-        buttons[2].download_button("Download merge history CSV", make_download_bytes(history_df if not history_df.empty else pd.DataFrame()), "ship_merge_history.csv", "text/csv", use_container_width=True)
-        buttons[3].download_button("Download canonical mapping CSV", make_download_bytes(mapping_df if not mapping_df.empty else pd.DataFrame()), "ship_canonical_mapping.csv", "text/csv", use_container_width=True)
+        buttons = st.columns(5)
+        buttons[0].download_button("Download review session JSON", session_bytes, "ship_review_session.json", "application/json", use_container_width=True)
+        buttons[1].download_button("Download auto-merge decisions CSV", make_download_bytes(auto_export if not auto_export.empty else pd.DataFrame()), "ship_auto_merge_decisions.csv", "text/csv", use_container_width=True)
+        buttons[2].download_button("Download manual review decisions CSV", make_download_bytes(pair_export if not pair_export.empty else pd.DataFrame()), "ship_manual_review_decisions.csv", "text/csv", use_container_width=True)
+        buttons[3].download_button("Download merge history CSV", make_download_bytes(history_df if not history_df.empty else pd.DataFrame()), "ship_merge_history.csv", "text/csv", use_container_width=True)
+        buttons[4].download_button("Download canonical mapping CSV", make_download_bytes(mapping_df if not mapping_df.empty else pd.DataFrame()), "ship_canonical_mapping.csv", "text/csv", use_container_width=True)
 
 
 if __name__ == "__main__":
