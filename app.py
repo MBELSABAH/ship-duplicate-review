@@ -515,6 +515,99 @@ def make_download_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 
+def build_cleaned_workbook_bytes(
+    raw_df: pd.DataFrame,
+    mapping_df: pd.DataFrame,
+    history_df: pd.DataFrame,
+    manual_decisions: dict,
+    auto_groups_df: pd.DataFrame,
+    column_config: dict,
+    sheet_name: str,
+    workbook_bytes: bytes | None = None,
+    candidate_queue_df: pd.DataFrame | None = None,
+) -> bytes:
+    entity_col = column_config["entity_column"]
+    cleaned_df = raw_df.copy()
+    original_values = cleaned_df[entity_col].fillna("").astype(str)
+
+    canonical_map = {}
+    cluster_map = {}
+    merged_values = set()
+    if not mapping_df.empty:
+        canonical_map = dict(zip(mapping_df["member_name"], mapping_df["canonical_name"]))
+        cluster_map = dict(zip(mapping_df["member_name"], mapping_df["cluster_id"]))
+        merged_values = set(mapping_df["member_name"].tolist())
+
+    status_map = {}
+    source_map = {}
+    score_map = {}
+    reason_map = {}
+
+    if not auto_groups_df.empty:
+        accepted = set(history_df.loc[history_df["merge_source"] == "auto_group", "merge_id"].tolist()) if not history_df.empty else set()
+        for _, row in auto_groups_df.iterrows():
+            if row["auto_group_key"] in accepted:
+                for member in row["members_list"]:
+                    status_map[member] = "merged"
+                    source_map[member] = "auto_group"
+                    reason_map[member] = row.get("reasons", "")
+
+    for rec in manual_decisions.values():
+        names = [rec.get("name_a", ""), rec.get("name_b", "")]
+        decision = rec.get("decision", "")
+        for name in names:
+            if name in merged_values or decision == "merge":
+                status_map[name] = "merged"
+                source_map[name] = "manual_pair"
+            elif decision == "keep_separate":
+                status_map[name] = "reviewed_keep_separate"
+                source_map[name] = "manual_keep_separate"
+            elif decision == "unsure":
+                status_map[name] = "reviewed_unsure"
+                source_map[name] = "manual_unsure"
+            score_map[name] = rec.get("score", "")
+            reason_map[name] = rec.get("reasons", "")
+
+    unreviewed_names = set()
+    if candidate_queue_df is not None and not candidate_queue_df.empty:
+        for _, row in candidate_queue_df.iterrows():
+            unreviewed_names.add(row["name_a"])
+            unreviewed_names.add(row["name_b"])
+
+    cleaned_df["dedupe_entity_column"] = entity_col
+    cleaned_df["dedupe_original_value"] = original_values
+    cleaned_df["dedupe_canonical_value"] = original_values.map(lambda x: canonical_map.get(x, x))
+    cleaned_df["dedupe_cluster_id"] = original_values.map(lambda x: cluster_map.get(x, ""))
+    cleaned_df["dedupe_review_status"] = original_values.map(lambda x: status_map.get(x, ""))
+    cleaned_df["dedupe_decision_source"] = original_values.map(lambda x: source_map.get(x, ""))
+    cleaned_df["dedupe_score"] = original_values.map(lambda x: score_map.get(x, ""))
+    cleaned_df["dedupe_reason"] = original_values.map(lambda x: reason_map.get(x, ""))
+
+    def default_status(v: str) -> str:
+        if v in merged_values:
+            return "merged"
+        if v in unreviewed_names:
+            return "unreviewed"
+        return "not_flagged"
+
+    missing_status = cleaned_df["dedupe_review_status"] == ""
+    cleaned_df.loc[missing_status, "dedupe_review_status"] = cleaned_df.loc[missing_status, "dedupe_original_value"].map(default_status)
+
+    if workbook_bytes:
+        all_sheets = pd.read_excel(io.BytesIO(workbook_bytes), sheet_name=None)
+        all_sheets[sheet_name] = cleaned_df
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            for name, df in all_sheets.items():
+                df.to_excel(writer, sheet_name=name, index=False)
+        return out.getvalue()
+
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        cleaned_df.to_excel(writer, sheet_name=sheet_name, index=False)
+    return out.getvalue()
+
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -821,6 +914,7 @@ def app():
 
     with tabs[3]:
         st.subheader("Export")
+        st.info("This exports a reviewed copy. The original uploaded workbook is not overwritten.")
         auto_export = auto_groups_df.copy()
         if not auto_export.empty:
             auto_export["status"] = auto_export["auto_group_key"].map(lambda gid: st.session_state["auto_status"].get(gid, "pending"))
@@ -875,6 +969,30 @@ def app():
         buttons[2].download_button("Download manual review decisions CSV", make_download_bytes(pair_export if not pair_export.empty else pd.DataFrame()), "ship_manual_review_decisions.csv", "text/csv", use_container_width=True)
         buttons[3].download_button("Download merge history CSV", make_download_bytes(history_df if not history_df.empty else pd.DataFrame()), "ship_merge_history.csv", "text/csv", use_container_width=True)
         buttons[4].download_button("Download canonical mapping CSV", make_download_bytes(mapping_df if not mapping_df.empty else pd.DataFrame()), "ship_canonical_mapping.csv", "text/csv", use_container_width=True)
+
+        base_name = getattr(uploaded, "name", "") or "cleaned_duplicate_review.xlsx"
+        if base_name.lower().endswith(".xlsx"):
+            cleaned_name = f"{base_name[:-5]}_reviewed.xlsx"
+        else:
+            cleaned_name = "cleaned_duplicate_review.xlsx"
+        cleaned_bytes = build_cleaned_workbook_bytes(
+            raw_df=raw_df,
+            mapping_df=mapping_df,
+            history_df=history_df,
+            manual_decisions=active_manual_decisions,
+            auto_groups_df=auto_groups_df,
+            column_config=column_config,
+            sheet_name=sheet_name,
+            workbook_bytes=file_bytes,
+            candidate_queue_df=queue_df,
+        )
+        st.download_button(
+            "Download cleaned workbook",
+            cleaned_bytes,
+            cleaned_name,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
 
 if __name__ == "__main__":
