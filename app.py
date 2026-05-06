@@ -17,19 +17,10 @@ from dedupe_engine import (
     preprocess_rows,
     resolved_names_from_auto,
     set_to_text,
+    SHIP_DEFAULTS,
 )
 
 APP_TITLE = "Duplicate Review MVP v3"
-
-SHIP_DEFAULTS = {
-    "entity_column": "Name of Vessel",
-    "year_column": "Year",
-    "type_column": "Type of Veseel",
-    "amount_column": "Amount (primary)",
-    "unit_column": "Unit (primary)",
-    "notes_column_1": "Remarks from ledger",
-    "notes_column_2": "Notes from transcriber",
-}
 
 def init_state():
     defaults = {
