@@ -487,6 +487,7 @@ def init_state():
         "auto_index": 0,
         "pair_index": 0,
         "column_config": {},
+        "queue_settings_fingerprint": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -667,8 +668,23 @@ def app():
     with st.sidebar:
         st.header("Setup")
         uploaded = st.file_uploader("Upload Excel workbook", type=["xlsx", "xls"])
-        fuzzy_threshold = st.slider("Manual review fuzzy threshold", 80, 98, 88, 1)
-        min_manual_score = st.slider("Minimum manual-review score", 0.0, 1.0, 0.75, 0.01)
+        fuzzy_threshold = st.slider(
+            "Name-match strictness",
+            60,
+            98,
+            88,
+            1,
+            help="Controls whether a pair is generated at all. Lower this if an expected pair is missing.",
+        )
+        min_manual_score = st.slider(
+            "Overall evidence threshold",
+            0.0,
+            1.0,
+            0.75,
+            0.01,
+            help="Filters generated pairs by combined evidence score. Lower this if generated pairs are hidden.",
+        )
+        hide_reviewed_candidates = st.checkbox("Hide reviewed candidates", value=True)
         sample_rows = st.slider("Sample original rows per side", 3, 12, 5, 1)
         if st.button("Reset all decisions", use_container_width=True):
             st.session_state["auto_status"] = {}
@@ -731,11 +747,30 @@ def app():
         st.warning("This column looks numeric. The tool works best for text/entity columns such as names, places, categories, or labels.")
 
     resolved_names = resolved_names_from_auto(auto_groups_df, st.session_state["auto_status"])
-    queue_df = generate_candidate_pairs(stats_df, entity_column=column_config["entity_column"], resolved_names=resolved_names, fuzzy_threshold=fuzzy_threshold)
-    if not queue_df.empty:
-        queue_df = queue_df[queue_df["score"] >= min_manual_score].reset_index(drop=True)
-
     active_manual_decisions = active_manual_decisions_for_config(st.session_state["manual_decisions"], column_config)
+    queue_settings_fingerprint = (
+        sheet_name,
+        tuple(sorted(column_config.items())),
+        fuzzy_threshold,
+        min_manual_score,
+        hide_reviewed_candidates,
+    )
+    if st.session_state.get("queue_settings_fingerprint") != queue_settings_fingerprint:
+        st.session_state["pair_index"] = 0
+        st.session_state["queue_settings_fingerprint"] = queue_settings_fingerprint
+
+    full_queue_df = generate_candidate_pairs(
+        stats_df,
+        entity_column=column_config["entity_column"],
+        resolved_names=resolved_names,
+        fuzzy_threshold=fuzzy_threshold,
+    )
+    score_filtered_queue_df = full_queue_df[full_queue_df["score"] >= min_manual_score].reset_index(drop=True) if not full_queue_df.empty else full_queue_df.copy()
+    visible_queue_df = score_filtered_queue_df.copy()
+    if hide_reviewed_candidates and not visible_queue_df.empty:
+        visible_queue_df = visible_queue_df[~visible_queue_df["pair_key"].isin(active_manual_decisions.keys())].reset_index(drop=True)
+    reviewed_hidden_count = max(len(score_filtered_queue_df) - len(visible_queue_df), 0) if hide_reviewed_candidates else 0
+
     hidden_decision_count = len(st.session_state["manual_decisions"]) - len(active_manual_decisions)
     if hidden_decision_count > 0:
         st.info("Some saved decisions belong to a different primary column and are hidden from the current mapping.")
@@ -747,7 +782,7 @@ def app():
     metrics[0].metric("Unique raw primary values", len(stats_df))
     metrics[1].metric("Safe auto-groups", len(auto_groups_df))
     metrics[2].metric("Accepted auto-groups", sum(1 for v in st.session_state["auto_status"].values() if v == "accepted"))
-    metrics[3].metric("Manual queue", len(queue_df) if queue_df is not None else 0)
+    metrics[3].metric("Manual queue", len(visible_queue_df) if visible_queue_df is not None else 0)
     metrics[4].metric("Merged names now", len(mapping_df))
     st.caption(f"Manual decisions in current mapping: {len(active_manual_decisions)} (total saved: {len(st.session_state['manual_decisions'])}).")
 
@@ -822,16 +857,25 @@ def app():
         st.subheader("Manual review queue")
         st.write("These are the remaining ambiguous candidates after any accepted safe auto-merges are removed from review.")
 
-        if queue_df is None or queue_df.empty:
-            st.success("No manual-review candidates remain under the current settings.")
+        st.caption(
+            f"Generated candidates: {len(full_queue_df)} | "
+            f"After score filter: {len(score_filtered_queue_df)} | "
+            f"Visible candidates: {len(visible_queue_df)} | "
+            f"Reviewed hidden: {reviewed_hidden_count}"
+        )
+
+        if visible_queue_df is None or visible_queue_df.empty:
+            st.success("No visible manual-review candidates under the current settings.")
+            if hide_reviewed_candidates and reviewed_hidden_count > 0:
+                st.info("Some reviewed candidates are hidden. Turn off Hide reviewed candidates to inspect them.")
         else:
-            idx = min(st.session_state["pair_index"], len(queue_df) - 1)
+            idx = min(st.session_state["pair_index"], len(visible_queue_df) - 1)
             st.session_state["pair_index"] = idx
-            row = queue_df.iloc[idx]
+            row = visible_queue_df.iloc[idx]
             decision = active_manual_decisions.get(row["pair_key"], {}).get("decision", "unreviewed")
 
             info = st.columns([2, 1.5, 1.5, 2])
-            info[0].markdown(f"### Candidate {idx + 1} / {len(queue_df)}")
+            info[0].markdown(f"### Candidate {idx + 1} / {len(visible_queue_df)}")
             info[1].markdown(f"**Score:** `{row['score']:.3f}`")
             info[2].markdown(f"**Decision:** {decision}")
             info[3].markdown(f"**Suggested canonical:** {row['suggested_canonical']}")
@@ -842,21 +886,24 @@ def app():
                 st.rerun()
             if nav[1].button("✅ Merge", use_container_width=True):
                 st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "merge", column_config["entity_column"])
-                st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(queue_df) - 1)
+                if not hide_reviewed_candidates:
+                    st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
             if nav[2].button("❌ Keep separate", use_container_width=True):
                 st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "keep_separate", column_config["entity_column"])
-                st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(queue_df) - 1)
+                if not hide_reviewed_candidates:
+                    st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
             if nav[3].button("🤔 Unsure", use_container_width=True):
                 st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "unsure", column_config["entity_column"])
-                st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(queue_df) - 1)
+                if not hide_reviewed_candidates:
+                    st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
             if nav[4].button("↩️ Undo this pair decision", use_container_width=True):
                 st.session_state["manual_decisions"].pop(row["pair_key"], None)
                 st.rerun()
             if nav[5].button("➡️ Next pair", use_container_width=True):
-                st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(queue_df) - 1)
+                st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
 
             st.markdown("#### Why this pair was flagged")
@@ -984,7 +1031,7 @@ def app():
             column_config=column_config,
             sheet_name=sheet_name,
             workbook_bytes=file_bytes,
-            candidate_queue_df=queue_df,
+            candidate_queue_df=score_filtered_queue_df,
         )
         st.download_button(
             "Download cleaned workbook",
