@@ -12,6 +12,32 @@ const friendlyMap = {
   notes_column_2: 'Notes evidence column 2',
 };
 
+function formatList(value) {
+  if (Array.isArray(value)) return value.join(', ');
+  if (typeof value === 'string') return value;
+  return '—';
+}
+
+function setManualDecisionRecord(candidate, entityColumn, decision) {
+  return {
+    pair_key: candidate.pair_key,
+    entity_column: entityColumn,
+    name_a: candidate.name_a,
+    name_b: candidate.name_b,
+    decision,
+    score: candidate.score,
+    raw_name_score: candidate.raw_name_score,
+    clean_name_score: candidate.clean_name_score,
+    year_score: candidate.year_score,
+    unit_score: candidate.unit_score,
+    type_score: candidate.type_score,
+    cargo_amount_score: candidate.cargo_amount_score,
+    reasons: candidate.reasons,
+    suggested_canonical: candidate.suggested_canonical,
+    updated_at: new Date().toISOString(),
+  };
+}
+
 export default function App() {
   const [step, setStep] = useState(0);
   const [file, setFile] = useState(null);
@@ -30,7 +56,7 @@ export default function App() {
 
   const summary = useMemo(() => {
     const autos = Object.values(autoStatus);
-    const manuals = Object.values(manualDecisions);
+    const manuals = Object.values(manualDecisions).map((record) => record.decision);
     return {
       acceptedAuto: autos.filter((v) => v === 'accepted').length,
       rejectedAuto: autos.filter((v) => v === 'rejected').length,
@@ -92,24 +118,24 @@ export default function App() {
 
       {step === 2 && <section className="card"><h2>Auto review</h2><button onClick={handleAnalyze}>Run analyze</button>
         <div className="cards">{(analyzeResult?.auto_groups || []).map((g, idx) => {
-          const key = g.group_id || `${g.canonical_name}-${idx}`;
-          return <article className="mini-card" key={key}><h3>{g.canonical_name || 'Suggested canonical'}</h3><p>Member names: {(g.member_names || []).join(', ')}</p><p>Total rows: {g.total_rows}</p><p>Years: {(g.years || []).join(', ')}</p><p>Reason: {g.reason || 'Safe auto-group'}</p><p>Status: {autoStatus[key] || 'pending'}</p><div className="actions"><button onClick={() => setAutoStatus({ ...autoStatus, [key]: 'accepted' })}>Accept</button><button onClick={() => setAutoStatus({ ...autoStatus, [key]: 'rejected' })}>Reject</button><button onClick={() => { const n = { ...autoStatus }; delete n[key]; setAutoStatus(n); }}>Undo</button></div></article>;
+          const key = g.auto_group_key || `auto-group-${idx}`;
+          return <article className="mini-card" key={key}><h3>{g.canonical_name || '—'}</h3><p>Member names: {formatList(g.members_list ?? g.member_names)}</p><p>Total rows: {g.total_rows ?? '—'}</p><p>Years: {g.min_year ?? '—'} - {g.max_year ?? '—'}</p><p>Reason: {formatList(g.reasons)}</p><p>Status: {autoStatus[key] || 'pending'}</p><div className="actions"><button onClick={() => setAutoStatus({ ...autoStatus, [key]: 'accepted' })}>Accept</button><button onClick={() => setAutoStatus({ ...autoStatus, [key]: 'rejected' })}>Reject</button><button onClick={() => { const n = { ...autoStatus }; delete n[key]; setAutoStatus(n); }}>Undo</button></div></article>;
         })}</div>
       </section>}
 
       {step === 3 && <section className="card"><h2>Manual review</h2>{activeCandidate ? <>
-        <p>Candidate {manualIndex + 1} of {manualQueue.length}</p><p>Score: {activeCandidate.score}</p><p>Suggested canonical: {activeCandidate.suggested_canonical || 'N/A'}</p><p>Reasons: {(activeCandidate.reasons || []).join(', ') || 'N/A'}</p>
+        <p>Candidate {manualIndex + 1} of {manualQueue.length}</p><p>Score: {activeCandidate.score}</p><p>Suggested canonical: {activeCandidate.suggested_canonical || '—'}</p><p>Reasons: {formatList(activeCandidate.reasons)}</p>
         <div className="compare"><div><h3>name_a</h3><p>{activeCandidate.name_a}</p></div><div><h3>name_b</h3><p>{activeCandidate.name_b}</p></div></div>
-        <ul><li>Name similarity: {activeCandidate.score}</li><li>Years: {activeCandidate.year_overlap ?? 'N/A'}</li><li>Unit: {activeCandidate.unit_match ?? 'N/A'}</li><li>Type/category: {activeCandidate.type_match ?? 'N/A'}</li><li>Amount: {activeCandidate.amount_overlap ?? 'N/A'}</li></ul>
-        <p>Status: {manualDecisions[activeCandidate.pair_key] || 'pending'}</p>
-        <div className="actions"><button onClick={() => setManualDecisions({ ...manualDecisions, [activeCandidate.pair_key]: 'merge' })}>Merge</button><button onClick={() => setManualDecisions({ ...manualDecisions, [activeCandidate.pair_key]: 'keep_separate' })}>Keep separate</button><button onClick={() => setManualDecisions({ ...manualDecisions, [activeCandidate.pair_key]: 'unsure' })}>Unsure</button><button onClick={() => { const n = { ...manualDecisions }; delete n[activeCandidate.pair_key]; setManualDecisions(n); }}>Undo</button><button onClick={() => setManualIndex(Math.max(0, manualIndex - 1))}>Previous candidate</button><button onClick={() => setManualIndex(Math.min(manualQueue.length - 1, manualIndex + 1))}>Next candidate</button></div>
+        <ul><li>Raw name similarity: {activeCandidate.raw_name_score ?? '—'}</li><li>Clean name similarity: {activeCandidate.clean_name_score ?? '—'}</li><li>Years: {activeCandidate.year_score ?? '—'}</li><li>Unit: {activeCandidate.unit_score ?? '—'}</li><li>Type/category: {activeCandidate.type_score ?? '—'}</li><li>Amount: {activeCandidate.cargo_amount_score ?? '—'}</li></ul>
+        <p>Status: {manualDecisions[activeCandidate.pair_key]?.decision || 'pending'}</p>
+        <div className="actions"><button onClick={() => setManualDecisions({ ...manualDecisions, [activeCandidate.pair_key]: setManualDecisionRecord(activeCandidate, columnConfig.entity_column, 'merge') })}>Merge</button><button onClick={() => setManualDecisions({ ...manualDecisions, [activeCandidate.pair_key]: setManualDecisionRecord(activeCandidate, columnConfig.entity_column, 'keep_separate') })}>Keep separate</button><button onClick={() => setManualDecisions({ ...manualDecisions, [activeCandidate.pair_key]: setManualDecisionRecord(activeCandidate, columnConfig.entity_column, 'unsure') })}>Unsure</button><button onClick={() => { const n = { ...manualDecisions }; delete n[activeCandidate.pair_key]; setManualDecisions(n); }}>Undo</button><button onClick={() => setManualIndex(Math.max(0, manualIndex - 1))}>Previous candidate</button><button onClick={() => setManualIndex(Math.min(manualQueue.length - 1, manualIndex + 1))}>Next candidate</button></div>
       </> : <p>No candidates available.</p>}</section>}
 
       {step === 4 && <section className="card"><h2>Export</h2><button onClick={handleExport}>Download cleaned workbook</button>
         <ul><li>accepted auto groups: {summary.acceptedAuto}</li><li>rejected auto groups: {summary.rejectedAuto}</li><li>manual merges: {summary.merge}</li><li>kept separate: {summary.keep}</li><li>unsure: {summary.unsure}</li></ul>
       </section>}
 
-      <div className="footer-nav"><button disabled={step === 0} onClick={() => setStep(step - 1)}>Previous</button><button disabled={step === steps.length - 1 || (step===0 && (!file || !sheetName))} onClick={() => setStep(step + 1)}>Next</button></div>
+      <div className="footer-nav"><button disabled={step === 0} onClick={() => setStep(step - 1)}>Previous</button><button disabled={step === steps.length - 1 || (step === 0 && (!file || !sheetName))} onClick={() => setStep(step + 1)}>Next</button></div>
     </div>
   );
 }
