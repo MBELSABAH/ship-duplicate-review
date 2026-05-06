@@ -26,7 +26,7 @@ python3 -m streamlit run app.py
 - Original workbook is never overwritten.
 - Column mapping defaults still match the original ship workbook when those columns exist.
 - Session JSON includes column mapping config plus auto/manual decisions.
-- Cleaned Excel export is **not** implemented in this sprint.
+- Cleaned Excel export is available through the app workflow and the FastAPI export endpoint.
 
 ## Running the apps
 

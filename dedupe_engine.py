@@ -9,6 +9,17 @@ import pandas as pd
 from rapidfuzz import fuzz
 
 
+
+SHIP_DEFAULTS = {
+    "entity_column": "Name of Vessel",
+    "year_column": "Year",
+    "type_column": "Type of Veseel",
+    "amount_column": "Amount (primary)",
+    "unit_column": "Unit (primary)",
+    "notes_column_1": "Remarks from ledger",
+    "notes_column_2": "Notes from transcriber",
+}
+
 def normalize_spaces(text: str) -> str:
     return re.sub('\\s+', ' ', text).strip()
 
