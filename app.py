@@ -192,14 +192,15 @@ def build_reason_list(name_score, same_clean, year_score, unit_score, type_score
     return reasons
 
 
-def choose_canonical_name(stats_df, name_list):
-    def canonical_sort_key(name: str):
-        compact = re.sub(r"[^A-Za-z0-9]", "", name)
-        all_caps = int(bool(compact) and compact.isupper())
-        punctuation_count = len(re.findall(r"[^\w\s]", name))
-        whitespace_normalized = re.sub(r"\s+", " ", name).strip()
-        return (all_caps, punctuation_count, len(whitespace_normalized), whitespace_normalized.lower())
+def canonical_sort_key(name: str):
+    compact = re.sub(r"[^A-Za-z0-9]", "", name)
+    all_caps = int(bool(compact) and compact.isupper())
+    punctuation_count = len(re.findall(r"[^\w\s]", name))
+    whitespace_normalized = re.sub(r"\s+", " ", name).strip()
+    return (all_caps, punctuation_count, len(whitespace_normalized), whitespace_normalized.lower())
 
+
+def choose_canonical_name(stats_df, name_list):
     subset = stats_df[stats_df["raw_name"].isin(name_list)].copy()
     subset = subset.sort_values(["row_count", "raw_name"], ascending=[False, True])
     if subset.empty:
@@ -453,7 +454,7 @@ def build_merge_outputs(stats_df, auto_groups_df, auto_status, manual_decisions)
 
     mapping_records = []
     for idx, members in enumerate(sorted(groups.values(), key=lambda g: (-len(g), sorted(g)[0])), start=1):
-        canonical = sorted(members, key=lambda n: (-row_count_map.get(n, 0), len(n), n.lower()))[0]
+        canonical = sorted(members, key=lambda n: (-row_count_map.get(n, 0), *canonical_sort_key(n)))[0]
         cluster_id = f"M{idx:04d}"
         for member in sorted(members):
             mapping_records.append(
