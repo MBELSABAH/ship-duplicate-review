@@ -30,12 +30,23 @@ def init_state():
         "pair_index": 0,
         "column_config": {},
         "queue_settings_fingerprint": None,
+        "pending_loaded_session": None,
+        "load_session_feedback": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
     if "pair_decisions" in st.session_state and st.session_state["pair_decisions"] and not st.session_state["manual_decisions"]:
         st.session_state["manual_decisions"] = {}
+
+def reset_decision_state():
+    st.session_state["auto_status"] = {}
+    st.session_state["manual_decisions"] = {}
+    st.session_state["auto_index"] = 0
+    st.session_state["pair_index"] = 0
+    st.session_state["queue_settings_fingerprint"] = None
+    if "pair_decisions" in st.session_state:
+        st.session_state["pair_decisions"] = {}
 
 @st.cache_data(show_spinner=False)
 def load_sheet_names(file_bytes: bytes):
@@ -108,10 +119,7 @@ def app():
         sample_rows = st.slider("Evidence rows per side", 3, 12, 5, 1, key="evidence_rows_per_side_slider")
         st.subheader("Danger / reset")
         if st.button("Reset all decisions", use_container_width=True, key="reset_all_decisions_button"):
-            st.session_state["auto_status"] = {}
-            st.session_state["manual_decisions"] = {}
-            st.session_state["auto_index"] = 0
-            st.session_state["pair_index"] = 0
+            reset_decision_state()
             st.rerun()
 
     if not uploaded:
@@ -120,6 +128,11 @@ def app():
 
     file_bytes = uploaded.getvalue()
     sheet_names = load_sheet_names(file_bytes)
+    pending_loaded_session = st.session_state.pop("pending_loaded_session", None)
+    if pending_loaded_session:
+        pending_sheet = pending_loaded_session.get("sheet_name")
+        if pending_sheet in sheet_names:
+            st.session_state["sheet_select"] = pending_sheet
 
     with st.sidebar:
         sheet_name = st.selectbox("Sheet", sheet_names, index=0, key="sheet_select")
@@ -128,12 +141,45 @@ def app():
     available_cols = raw_df_preview.columns.tolist()
     text_candidates = [c for c in available_cols if raw_df_preview[c].dtype == "object"]
     default_entity = SHIP_DEFAULTS["entity_column"] if SHIP_DEFAULTS["entity_column"] in available_cols else (text_candidates[0] if text_candidates else available_cols[0])
+    if pending_loaded_session:
+        saved_cfg = pending_loaded_session.get("column_config", {}) if isinstance(pending_loaded_session.get("column_config", {}), dict) else {}
+        missing_cols = [v for v in saved_cfg.values() if v and v not in available_cols]
+        mapping_to_widget = {
+            "entity_column": "entity_column_select",
+            "year_column": "year_column_select",
+            "type_column": "type_column_select",
+            "amount_column": "amount_column_select",
+            "unit_column": "unit_column_select",
+            "notes_column_1": "notes_column_1_select",
+            "notes_column_2": "notes_column_2_select",
+        }
+        for cfg_key, widget_key in mapping_to_widget.items():
+            value = saved_cfg.get(cfg_key)
+            fallback = default_entity if cfg_key == "entity_column" else "(None)"
+            if value in available_cols:
+                st.session_state[widget_key] = value
+            else:
+                st.session_state[widget_key] = fallback
+        st.session_state["column_config"] = saved_cfg
+        st.session_state["auto_status"] = pending_loaded_session.get("auto_status", {})
+        st.session_state["manual_decisions"] = pending_loaded_session.get("manual_decisions", {})
+        st.session_state["auto_index"] = 0
+        st.session_state["pair_index"] = 0
+        st.session_state["queue_settings_fingerprint"] = None
+        if missing_cols:
+            msg = f"Loaded session. Some saved columns are missing in the current sheet: {', '.join(sorted(set(missing_cols)))}. Current mapping fallback was used where needed."
+            st.session_state["load_session_feedback"] = ("warning", msg)
+        else:
+            st.session_state["load_session_feedback"] = ("success", "Review session loaded.")
 
     saved_config = st.session_state.get("column_config", {}) or {}
     with st.sidebar:
         st.subheader("Column mapping")
         entity_default = saved_config.get("entity_column") if saved_config.get("entity_column") in available_cols else default_entity
-        entity_column = st.selectbox("Primary column to deduplicate/review", available_cols, index=available_cols.index(entity_default), key="entity_column_select")
+        entity_select_kwargs = {"key": "entity_column_select"}
+        if not pending_loaded_session:
+            entity_select_kwargs["index"] = available_cols.index(entity_default)
+        entity_column = st.selectbox("Primary column to deduplicate/review", available_cols, **entity_select_kwargs)
         optional_options = ["(None)"] + available_cols
         def optional_select(label, cfg_key, widget_key):
             from_saved = saved_config.get(cfg_key)
@@ -141,7 +187,10 @@ def app():
                 default_val = from_saved
             else:
                 default_val = SHIP_DEFAULTS[cfg_key] if SHIP_DEFAULTS[cfg_key] in available_cols else "(None)"
-            return st.selectbox(label, optional_options, index=optional_options.index(default_val), key=widget_key)
+            select_kwargs = {"key": widget_key}
+            if not pending_loaded_session:
+                select_kwargs["index"] = optional_options.index(default_val)
+            return st.selectbox(label, optional_options, **select_kwargs)
         year_column = optional_select("Year/date column (optional)", "year_column", "year_column_select")
         type_column = optional_select("Type/category column (optional)", "type_column", "type_column_select")
         amount_column = optional_select("Amount column (optional)", "amount_column", "amount_column_select")
@@ -163,6 +212,13 @@ def app():
     st.session_state["column_config"] = column_config
 
     raw_df, rows_df, stats_df, auto_groups_df = build_base_data(file_bytes, sheet_name, column_config)
+    load_session_feedback = st.session_state.pop("load_session_feedback", None)
+    if load_session_feedback:
+        level, message = load_session_feedback
+        if level == "warning":
+            st.warning(message)
+        else:
+            st.success(message)
 
     if pd.api.types.is_numeric_dtype(raw_df[column_config["entity_column"]]):
         st.warning("This column looks numeric. The tool works best for text/entity columns such as names, places, categories, or labels.")
@@ -227,29 +283,49 @@ def app():
         else:
             visible_auto_groups_df = auto_preview_df.reset_index(drop=True)
         reviewed_auto_hidden_count = len(auto_preview_df) - len(visible_auto_groups_df) if hide_reviewed_candidates else 0
+        has_auto_groups = not auto_groups_df.empty
+        auto_decision_count = len(st.session_state["auto_status"])
 
         st.caption(f"Diagnostics — generated: {len(auto_preview_df)} | visible: {len(visible_auto_groups_df)} | reviewed hidden: {reviewed_auto_hidden_count}")
+        with st.expander("Bulk actions", expanded=True):
+            actions = st.columns(3)
+            if actions[0].button(
+                "Accept all safe auto-merges",
+                use_container_width=True,
+                key="auto_bulk_accept_button",
+                disabled=not has_auto_groups,
+            ):
+                for gid in auto_groups_df["auto_group_key"].tolist():
+                    st.session_state["auto_status"][gid] = "accepted"
+                st.session_state["auto_index"] = 0
+                st.rerun()
+            if actions[1].button(
+                "Reject all safe auto-merges",
+                use_container_width=True,
+                key="auto_bulk_reject_button",
+                disabled=not has_auto_groups,
+            ):
+                for gid in auto_groups_df["auto_group_key"].tolist():
+                    st.session_state["auto_status"][gid] = "rejected"
+                st.session_state["auto_index"] = 0
+                st.rerun()
+            if actions[2].button(
+                "Clear all auto-merge decisions",
+                use_container_width=True,
+                key="clear_all_auto_decisions_button",
+                disabled=auto_decision_count == 0,
+            ):
+                st.session_state["auto_status"] = {}
+                st.session_state["auto_index"] = 0
+                st.rerun()
+            if auto_decision_count == 0:
+                st.info("No saved auto-merge decisions to clear.")
 
         if visible_auto_groups_df.empty:
             st.info("No visible safe auto-groups under the current settings.")
             if hide_reviewed_candidates and reviewed_auto_hidden_count > 0:
                 st.info("Some reviewed auto-groups are hidden. Turn off Hide reviewed candidates to inspect them.")
         else:
-            with st.expander("Bulk actions", expanded=True):
-                actions = st.columns(3)
-                if actions[0].button("Accept all safe auto-merges", use_container_width=True, key="auto_bulk_accept"):
-                    for gid in auto_groups_df["auto_group_key"].tolist():
-                        st.session_state["auto_status"][gid] = "accepted"
-                    st.rerun()
-                if actions[1].button("Reject all safe auto-merges", use_container_width=True, key="auto_bulk_reject"):
-                    for gid in auto_groups_df["auto_group_key"].tolist():
-                        st.session_state["auto_status"][gid] = "rejected"
-                    st.rerun()
-                if actions[2].button("Clear all auto decisions", use_container_width=True, key="auto_bulk_clear"):
-                    for gid in auto_groups_df["auto_group_key"].tolist():
-                        st.session_state["auto_status"].pop(gid, None)
-                    st.rerun()
-
             idx = min(st.session_state["auto_index"], len(visible_auto_groups_df) - 1)
             st.session_state["auto_index"] = idx
             row = visible_auto_groups_df.iloc[idx]
@@ -417,39 +493,16 @@ def app():
             if uploaded_session is None:
                 st.warning("Please upload a review session JSON first.")
             else:
-                data = json.loads(uploaded_session.getvalue().decode("utf-8"))
-                saved_cfg = data.get("column_config", {})
-                missing_cols = [v for v in saved_cfg.values() if v and v not in raw_df.columns]
-                if missing_cols:
-                    st.warning(f"Some saved columns are missing in the current sheet: {', '.join(sorted(set(missing_cols)))}. Using current mapping where needed.")
+                try:
+                    data = json.loads(uploaded_session.getvalue().decode("utf-8"))
+                except json.JSONDecodeError:
+                    st.warning("Invalid JSON file. Please upload a valid review session JSON.")
                 else:
-                    st.success("Loaded session column mapping.")
-                st.session_state["column_config"] = saved_cfg
-                mapping_to_widget = {
-                    "entity_column": "entity_column_select",
-                    "year_column": "year_column_select",
-                    "type_column": "type_column_select",
-                    "amount_column": "amount_column_select",
-                    "unit_column": "unit_column_select",
-                    "notes_column_1": "notes_column_1_select",
-                    "notes_column_2": "notes_column_2_select",
-                }
-                for cfg_key, widget_key in mapping_to_widget.items():
-                    value = saved_cfg.get(cfg_key)
-                    if cfg_key == "entity_column":
-                        fallback = default_entity
+                    if not isinstance(data, dict):
+                        st.warning("Invalid session format. The JSON root must be an object.")
                     else:
-                        fallback = "(None)"
-                    if value in available_cols:
-                        st.session_state[widget_key] = value
-                    else:
-                        st.session_state[widget_key] = fallback
-                st.session_state["auto_status"] = data.get("auto_status", {})
-                st.session_state["manual_decisions"] = data.get("manual_decisions", {})
-                st.session_state["auto_index"] = 0
-                st.session_state["pair_index"] = 0
-                st.success("Review session loaded.")
-                st.rerun()
+                        st.session_state["pending_loaded_session"] = data
+                        st.rerun()
 
         base_name = getattr(uploaded, "name", "") or "cleaned_duplicate_review.xlsx"
         if base_name.lower().endswith(".xlsx"):
