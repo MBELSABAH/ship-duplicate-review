@@ -1,4 +1,5 @@
 import io
+import json
 
 import pandas as pd
 import streamlit as st
@@ -45,10 +46,12 @@ def init_state():
     if "pair_decisions" in st.session_state and st.session_state["pair_decisions"] and not st.session_state["manual_decisions"]:
         st.session_state["manual_decisions"] = {}
 
+@st.cache_data(show_spinner=False)
 def load_sheet_names(file_bytes: bytes):
     bio = io.BytesIO(file_bytes)
     return pd.ExcelFile(bio).sheet_names
 
+@st.cache_data(show_spinner=False)
 def build_base_data(file_bytes: bytes, sheet_name: str, column_config: dict):
     bio = io.BytesIO(file_bytes)
     raw_df = pd.read_excel(bio, sheet_name=sheet_name)
@@ -480,3 +483,5 @@ def app():
             use_container_width=True,
         )
 
+if __name__ == "__main__":
+    app()
