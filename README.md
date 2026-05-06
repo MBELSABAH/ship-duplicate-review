@@ -1,13 +1,25 @@
 # Ship Duplicate Review MVP v3
 
-This Streamlit app now supports **generic Excel workbooks** via column mapping while preserving Sprint 1 stable decisions/session behavior.
+This project supports the duplicate-review workflow with a FastAPI backend, a React frontend shell, and a Streamlit fallback interface.
 
-## Install
+## Install backend dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-## Run
+## Run backend
+```bash
+python3 -m uvicorn api:app --reload
+```
+
+## Frontend
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+## Streamlit fallback
 ```bash
 python3 -m streamlit run app.py
 ```
@@ -27,21 +39,3 @@ python3 -m streamlit run app.py
 - Column mapping defaults still match the original ship workbook when those columns exist.
 - Session JSON includes column mapping config plus auto/manual decisions.
 - Cleaned Excel export is available through the app workflow and the FastAPI export endpoint.
-
-## Running the apps
-
-Streamlit app:
-
-```bash
-python3 -m streamlit run app.py
-```
-
-FastAPI backend:
-
-```bash
-python3 -m uvicorn api:app --reload
-```
-
-API docs:
-
-- http://127.0.0.1:8000/docs

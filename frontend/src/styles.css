@@ -1,0 +1,95 @@
+:root {
+  font-family: "Inter", "Segoe UI", Arial, sans-serif;
+  color: #1e293b;
+  background: #f3f5f9;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+
+.page-shell {
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  padding: 32px 16px;
+}
+
+.workbench {
+  width: 100%;
+  max-width: 1120px;
+  display: grid;
+  gap: 16px;
+}
+
+.workbench-header h1 { margin: 0 0 8px; font-size: 1.8rem; }
+.workbench-header p { margin: 0; color: #475569; }
+
+.card {
+  background: #fff;
+  border: 1px solid #dbe2ea;
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.field-label { display: block; margin-bottom: 8px; font-weight: 600; }
+.field-group { margin-top: 12px; }
+input, select {
+  width: 100%;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid #cbd5e1;
+  background: #fff;
+}
+
+.mapping-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.mapping-grid label span, .threshold-row label span {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 0.9rem;
+}
+
+.threshold-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.primary-btn {
+  background: #1d4ed8;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.primary-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+.primary-btn.large { width: 100%; padding: 12px 16px; font-size: 1rem; }
+
+.summary-grid {
+  margin-top: 16px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px;
+}
+.summary-grid article {
+  border: 1px solid #dbe2ea;
+  border-radius: 10px;
+  padding: 10px;
+  background: #f8fafc;
+}
+.summary-grid h3 { margin: 0 0 6px; font-size: 0.9rem; color: #475569; }
+.summary-grid p { margin: 0; font-size: 1.3rem; font-weight: 700; }
+
+.table-wrapper { overflow-x: auto; margin-top: 12px; }
+table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+th, td { border-bottom: 1px solid #e2e8f0; text-align: left; padding: 8px; }
+th { background: #f8fafc; }
+
+.status-line { min-height: 20px; color: #334155; font-size: 0.9rem; }
+.export-card p { color: #475569; }
