@@ -49,8 +49,8 @@ def make_pair_key(name_a: str, name_b: str, entity_column: str = "Name of Vessel
     return "P" + stable_hash(raw_key)
 
 
-def make_auto_group_key(strict_key: str) -> str:
-    return "A" + stable_hash("auto::" + str(strict_key))
+def make_auto_group_key(strict_key: str, entity_column: str) -> str:
+    return "A" + stable_hash(f"auto::{entity_column}::{strict_key}")
 
 
 def strict_name_key(value: str) -> str:
@@ -252,7 +252,7 @@ def build_name_stats(rows: pd.DataFrame) -> pd.DataFrame:
     return stats
 
 
-def build_safe_auto_groups(stats: pd.DataFrame) -> pd.DataFrame:
+def build_safe_auto_groups(stats: pd.DataFrame, entity_column: str) -> pd.DataFrame:
     groups = []
     for strict_key, grp in stats.groupby("strict_name_key", sort=False):
         if not strict_key or len(grp) < 2:
@@ -267,7 +267,7 @@ def build_safe_auto_groups(stats: pd.DataFrame) -> pd.DataFrame:
         groups.append(
             {
                 "auto_group_id": f"A{len(groups)+1:04d}",
-                "auto_group_key": make_auto_group_key(strict_key),
+                "auto_group_key": make_auto_group_key(strict_key, entity_column),
                 "strict_name_key": strict_key,
                 "canonical_name": canonical,
                 "member_count": len(grp),
@@ -478,6 +478,7 @@ def init_state():
         "manual_decisions": {},
         "auto_index": 0,
         "pair_index": 0,
+        "column_config": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -498,7 +499,7 @@ def build_base_data(file_bytes: bytes, sheet_name: str, column_config: dict):
     raw_df = pd.read_excel(bio, sheet_name=sheet_name)
     rows_df = preprocess_rows(raw_df, column_config)
     stats_df = build_name_stats(rows_df)
-    auto_groups_df = build_safe_auto_groups(stats_df)
+    auto_groups_df = build_safe_auto_groups(stats_df, column_config["entity_column"])
     return raw_df, rows_df, stats_df, auto_groups_df
 
 
@@ -590,19 +591,25 @@ def app():
     text_candidates = [c for c in available_cols if raw_df_preview[c].dtype == "object"]
     default_entity = SHIP_DEFAULTS["entity_column"] if SHIP_DEFAULTS["entity_column"] in available_cols else (text_candidates[0] if text_candidates else available_cols[0])
 
+    saved_config = st.session_state.get("column_config", {}) or {}
     with st.sidebar:
         st.header("Column mapping")
-        entity_column = st.selectbox("Primary column to deduplicate/review", available_cols, index=available_cols.index(default_entity))
+        entity_default = saved_config.get("entity_column") if saved_config.get("entity_column") in available_cols else default_entity
+        entity_column = st.selectbox("Primary column to deduplicate/review", available_cols, index=available_cols.index(entity_default), key="entity_column_select")
         optional_options = ["(None)"] + available_cols
-        def optional_select(label, key):
-            default_val = SHIP_DEFAULTS[key] if SHIP_DEFAULTS[key] in available_cols else "(None)"
-            return st.selectbox(label, optional_options, index=optional_options.index(default_val))
-        year_column = optional_select("Year/date column (optional)", "year_column")
-        type_column = optional_select("Type/category column (optional)", "type_column")
-        amount_column = optional_select("Amount column (optional)", "amount_column")
-        unit_column = optional_select("Unit column (optional)", "unit_column")
-        notes_column_1 = optional_select("Remarks/notes column 1 (optional)", "notes_column_1")
-        notes_column_2 = optional_select("Remarks/notes column 2 (optional)", "notes_column_2")
+        def optional_select(label, cfg_key, widget_key):
+            from_saved = saved_config.get(cfg_key)
+            if from_saved in available_cols:
+                default_val = from_saved
+            else:
+                default_val = SHIP_DEFAULTS[cfg_key] if SHIP_DEFAULTS[cfg_key] in available_cols else "(None)"
+            return st.selectbox(label, optional_options, index=optional_options.index(default_val), key=widget_key)
+        year_column = optional_select("Year/date column (optional)", "year_column", "year_column_select")
+        type_column = optional_select("Type/category column (optional)", "type_column", "type_column_select")
+        amount_column = optional_select("Amount column (optional)", "amount_column", "amount_column_select")
+        unit_column = optional_select("Unit column (optional)", "unit_column", "unit_column_select")
+        notes_column_1 = optional_select("Remarks/notes column 1 (optional)", "notes_column_1", "notes_column_1_select")
+        notes_column_2 = optional_select("Remarks/notes column 2 (optional)", "notes_column_2", "notes_column_2_select")
 
     def none_if_placeholder(v):
         return None if v == "(None)" else v
@@ -615,6 +622,7 @@ def app():
         "notes_column_1": none_if_placeholder(notes_column_1),
         "notes_column_2": none_if_placeholder(notes_column_2),
     }
+    st.session_state["column_config"] = column_config
 
     raw_df, rows_df, stats_df, auto_groups_df = build_base_data(file_bytes, sheet_name, column_config)
 
@@ -819,6 +827,28 @@ def app():
                 missing_cols = [v for v in saved_cfg.values() if v and v not in raw_df.columns]
                 if missing_cols:
                     st.warning(f"Some saved columns are missing in the current sheet: {', '.join(sorted(set(missing_cols)))}. Using current mapping where needed.")
+                else:
+                    st.success("Loaded session column mapping.")
+                st.session_state["column_config"] = saved_cfg
+                mapping_to_widget = {
+                    "entity_column": "entity_column_select",
+                    "year_column": "year_column_select",
+                    "type_column": "type_column_select",
+                    "amount_column": "amount_column_select",
+                    "unit_column": "unit_column_select",
+                    "notes_column_1": "notes_column_1_select",
+                    "notes_column_2": "notes_column_2_select",
+                }
+                for cfg_key, widget_key in mapping_to_widget.items():
+                    value = saved_cfg.get(cfg_key)
+                    if cfg_key == "entity_column":
+                        fallback = default_entity
+                    else:
+                        fallback = "(None)"
+                    if value in available_cols:
+                        st.session_state[widget_key] = value
+                    else:
+                        st.session_state[widget_key] = fallback
                 st.session_state["auto_status"] = data.get("auto_status", {})
                 st.session_state["manual_decisions"] = data.get("manual_decisions", {})
                 st.session_state["auto_index"] = 0
