@@ -796,8 +796,14 @@ def app():
         st.download_button("Download standardized workbook", standardized_bytes, standardized_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, key="download_standardized_workbook")
         st.caption("This export replaces the selected entity column with reviewed canonical values only. It does not add audit columns.")
         with st.expander("Continue later", expanded=True):
-            session_actions = st.columns([1, 1.2])
-            session_actions[0].download_button("Download review session JSON", session_bytes, "ship_review_session.json", "application/json", use_container_width=True, key="download_review_session_json")
+            st.download_button(
+                "Download review session JSON",
+                session_bytes,
+                "ship_review_session.json",
+                "application/json",
+                use_container_width=True,
+                key="download_review_session_json",
+            )
         with st.expander("Audit exports", expanded=True):
             st.download_button("auto decisions CSV", make_download_bytes(auto_export if not auto_export.empty else pd.DataFrame()), "ship_auto_merge_decisions.csv", "text/csv", use_container_width=True, key="download_auto_decisions_csv")
             st.download_button("manual decisions CSV", make_download_bytes(pair_export if not pair_export.empty else pd.DataFrame()), "ship_manual_review_decisions.csv", "text/csv", use_container_width=True, key="download_manual_decisions_csv")
