@@ -487,6 +487,48 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
         cleaned_df.to_excel(writer, sheet_name=sheet_name, index=False)
     return out.getvalue()
 
+def build_standardized_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame, column_config: dict, sheet_name: str, workbook_bytes: bytes | None) -> bytes:
+    entity_col = column_config['entity_column']
+    canonical_map = {}
+    if not mapping_df.empty:
+        canonical_map = dict(zip(mapping_df['member_name'], mapping_df['canonical_name']))
+
+    standardized_df = raw_df.copy()
+    standardized_original_values = standardized_df[entity_col].fillna('').astype(str).map(lambda x: str(x).strip())
+    standardized_df[entity_col] = standardized_original_values.map(lambda x: canonical_map.get(x, x))
+
+    def to_excel_value(value):
+        if pd.isna(value):
+            return None
+        if isinstance(value, pd.Timestamp):
+            return value.to_pydatetime()
+        return value
+
+    if workbook_bytes:
+        workbook = load_workbook(io.BytesIO(workbook_bytes))
+        if sheet_name not in workbook.sheetnames:
+            raise KeyError(f'Sheet not found: {sheet_name}')
+        worksheet = workbook[sheet_name]
+
+        raw_columns = raw_df.columns.tolist()
+        if entity_col not in raw_columns:
+            raise KeyError(f'Entity column not found: {entity_col}')
+        entity_col_idx = raw_columns.index(entity_col) + 1
+
+        values = standardized_df[entity_col].tolist()
+        for row_idx, value in enumerate(values):
+            excel_row = row_idx + 2
+            worksheet.cell(row=excel_row, column=entity_col_idx, value=to_excel_value(value))
+
+        out = io.BytesIO()
+        workbook.save(out)
+        return out.getvalue()
+
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine='openpyxl') as writer:
+        standardized_df.to_excel(writer, sheet_name=sheet_name, index=False)
+    return out.getvalue()
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
