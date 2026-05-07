@@ -1,8 +1,14 @@
 # Ship Duplicate Review
 
-A Streamlit-based duplicate-review tool for messy historical spreadsheet data. The app helps detect, review, merge, and export duplicate or near-duplicate entity names while keeping the workflow auditable and reversible.
+A Streamlit-based duplicate-review tool for messy historical spreadsheet data. The app helps detect, review, merge, undo, standardize, and export duplicate or near-duplicate entity names while keeping the workflow auditable and reversible.
 
-The project was built for historical ship-ledger data, where the same vessel may appear under inconsistent spelling, punctuation, capitalization, or transcription variants. Version 3 also supports generic Excel workbooks through column mapping, so the review workflow can be applied to other text/entity columns too.
+The project was built for historical ship-ledger data, where the same vessel may appear under inconsistent spelling, punctuation, capitalization, or transcription variants. The current version also supports generic Excel workbooks through column mapping, so the review workflow can be applied to other text/entity columns too.
+
+## Live demo
+
+The public Streamlit app is linked in the repository **About** section.
+
+> Do not upload private, restricted, or sensitive research data to a public deployment unless you have permission to do so.
 
 ## What it does
 
@@ -14,9 +20,11 @@ The project was built for historical ship-ledger data, where the same vessel may
 - Generate fuzzy manual-review candidates
 - Review candidates as `merge`, `keep separate`, or `unsure`
 - Hide or show reviewed candidates
-- Undo saved auto/manual decisions
+- Undo saved auto/manual decisions, including direct row-selection undo in Merge History
 - Save and reload review sessions as JSON
-- Export a cleaned workbook without overwriting the original file
+- Export a reviewed/auditable workbook that keeps original values and appends dedupe columns
+- Export a standardized workbook that replaces the selected entity column with reviewed canonical values
+- Preserve original Excel workbook formatting as much as possible during export
 - Export audit files such as auto decisions, manual decisions, merge history, and canonical mapping CSVs
 
 ## Why this project matters
@@ -30,6 +38,29 @@ This tool uses a human-in-the-loop workflow:
 3. show evidence before decisions are made
 4. keep decisions traceable
 5. allow undo and exportable audit records
+6. produce both auditable and standardized outputs
+
+## Export options
+
+### Reviewed workbook
+
+The reviewed workbook keeps the selected entity column unchanged and appends dedupe/audit columns such as:
+
+- `dedupe_original_value`
+- `dedupe_canonical_value`
+- `dedupe_cluster_id`
+- `dedupe_review_status`
+- `dedupe_decision_source`
+- `dedupe_score`
+- `dedupe_reason`
+
+Use this when you need a traceable research output.
+
+### Standardized workbook
+
+The standardized workbook replaces the selected entity column with reviewed canonical values and does not add audit columns.
+
+Use this when you need a clean downstream-analysis file for filtering, pivot tables, or further processing.
 
 ## Tech stack
 
@@ -74,7 +105,7 @@ Install dependencies:
 python3 -m pip install -r requirements.txt
 ```
 
-## Run the Streamlit app
+## Run the Streamlit app locally
 
 ```bash
 python3 -m streamlit run app.py
@@ -102,27 +133,33 @@ http://127.0.0.1:8000/docs
 4. Map optional evidence columns.
 5. Review safe auto-merge groups.
 6. Review fuzzy manual candidates.
-7. Save a review-session JSON if you want to continue later.
-8. Export the cleaned workbook and audit CSV files.
+7. Use Merge History to inspect or undo decisions.
+8. Save a review-session JSON if you want to continue later.
+9. Export either a reviewed workbook, a standardized workbook, or audit CSV files.
 
 ## Notes on data safety
 
 - The uploaded workbook is never overwritten.
-- The cleaned workbook is exported as a separate file.
+- Exported workbooks are generated as separate files.
 - Review decisions can be saved separately as JSON.
 - Real research datasets should not be committed to the repository unless permission is explicitly granted.
+- Public deployments should be used only with data that is safe to upload.
 
 ## Current status
 
-This is an MVP research tool. The core workflow is functional, but the project is still evolving.
+This is an MVP research tool. The core workflow is functional and currently supports generic Excel column mapping, safe auto-merges, manual review, undo, session save/load, formatting-preserving workbook export, and Streamlit Cloud deployment.
 
 Strong next improvements include:
 
 - group-level review instead of only pair-level review
 - persistent saved review projects
 - reusable canonical dictionaries across future workbooks
-- better screenshots and demo data
-- Streamlit Community Cloud deployment
+- screenshots and demo data
+- richer tests around export behavior and Streamlit UI interactions
+
+## License
+
+No formal license has been specified yet. Please contact the maintainer before reusing or redistributing this code.
 
 ## Suggested GitHub topics
 
