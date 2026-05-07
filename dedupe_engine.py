@@ -152,11 +152,20 @@ def build_reason_list(name_score, same_clean, year_score, unit_score, type_score
     return reasons
 
 def canonical_sort_key(name: str):
-    compact = re.sub('[^A-Za-z0-9]', '', name)
-    all_caps = int(bool(compact) and compact.isupper())
-    punctuation_count = len(re.findall('[^\\w\\s]', name))
-    whitespace_normalized = re.sub('\\s+', ' ', name).strip()
-    return (all_caps, punctuation_count, len(whitespace_normalized), whitespace_normalized.lower())
+    whitespace_normalized = normalize_spaces(str(name))
+    compact_alnum = re.sub('[^A-Za-z0-9]', '', whitespace_normalized)
+    letters_only = re.sub('[^A-Za-z]', '', whitespace_normalized)
+    all_caps = int(bool(letters_only) and letters_only.isupper())
+    punctuation_count = len(re.findall('[^\\w\\s]', whitespace_normalized))
+    cleaned_for_length = re.sub('[^A-Za-z0-9\\s]', '', whitespace_normalized)
+    cleaned_for_length = normalize_spaces(cleaned_for_length)
+    return (
+        all_caps,
+        punctuation_count,
+        len(cleaned_for_length),
+        whitespace_normalized.lower(),
+        compact_alnum.lower(),
+    )
 
 def choose_canonical_name(stats_df, name_list):
     subset = stats_df[stats_df['raw_name'].isin(name_list)].copy()
@@ -342,6 +351,7 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
     entity_col = column_config['entity_column']
     cleaned_df = raw_df.copy()
     original_values = cleaned_df[entity_col].fillna('').astype(str)
+    normalized_original_values = original_values.map(lambda x: str(x).strip())
     canonical_map = {}
     cluster_map = {}
     merged_values = set()
@@ -383,12 +393,12 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
             unreviewed_names.add(row['name_b'])
     cleaned_df['dedupe_entity_column'] = entity_col
     cleaned_df['dedupe_original_value'] = original_values
-    cleaned_df['dedupe_canonical_value'] = original_values.map(lambda x: canonical_map.get(x, x))
-    cleaned_df['dedupe_cluster_id'] = original_values.map(lambda x: cluster_map.get(x, ''))
-    cleaned_df['dedupe_review_status'] = original_values.map(lambda x: status_map.get(x, ''))
-    cleaned_df['dedupe_decision_source'] = original_values.map(lambda x: source_map.get(x, ''))
-    cleaned_df['dedupe_score'] = original_values.map(lambda x: score_map.get(x, ''))
-    cleaned_df['dedupe_reason'] = original_values.map(lambda x: reason_map.get(x, ''))
+    cleaned_df['dedupe_canonical_value'] = normalized_original_values.map(lambda x: canonical_map.get(x, x))
+    cleaned_df['dedupe_cluster_id'] = normalized_original_values.map(lambda x: cluster_map.get(x, ''))
+    cleaned_df['dedupe_review_status'] = normalized_original_values.map(lambda x: status_map.get(x, '')).fillna('')
+    cleaned_df['dedupe_decision_source'] = normalized_original_values.map(lambda x: source_map.get(x, '')).fillna('')
+    cleaned_df['dedupe_score'] = normalized_original_values.map(lambda x: score_map.get(x, '')).fillna('')
+    cleaned_df['dedupe_reason'] = normalized_original_values.map(lambda x: reason_map.get(x, '')).fillna('')
 
     def default_status(v: str) -> str:
         if v in merged_values:
@@ -396,8 +406,8 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
         if v in unreviewed_names:
             return 'unreviewed'
         return 'not_flagged'
-    missing_status = cleaned_df['dedupe_review_status'] == ''
-    cleaned_df.loc[missing_status, 'dedupe_review_status'] = cleaned_df.loc[missing_status, 'dedupe_original_value'].map(default_status)
+    missing_status = cleaned_df['dedupe_review_status'].isna() | (cleaned_df['dedupe_review_status'] == '')
+    cleaned_df.loc[missing_status, 'dedupe_review_status'] = normalized_original_values[missing_status].map(default_status)
     if workbook_bytes:
         all_sheets = pd.read_excel(io.BytesIO(workbook_bytes), sheet_name=None)
         all_sheets[sheet_name] = cleaned_df
