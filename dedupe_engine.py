@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter, range_boundaries
-from openpyxl.worksheet.filters import AutoFilter
 from openpyxl.worksheet.table import TableColumn
 from rapidfuzz import fuzz
 
@@ -487,9 +486,7 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
                 continue
             new_ref = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(dedupe_max_col_idx)}{max_row}"
             table.ref = new_ref
-            if table.autoFilter is None:
-                table.autoFilter = AutoFilter(ref=new_ref)
-            else:
+            if table.autoFilter is not None:
                 table.autoFilter.ref = new_ref
 
             total_cols = dedupe_max_col_idx - min_col + 1
