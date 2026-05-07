@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, range_boundaries
 from rapidfuzz import fuzz
 
 
@@ -469,6 +469,21 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
                 if template_dim is not None:
                     new_letter = get_column_letter(new_idx)
                     worksheet.column_dimensions[new_letter].width = template_dim.width
+
+        dedupe_max_col_idx = max(dedupe_column_indexes.values()) if dedupe_column_indexes else worksheet.max_column
+
+        # If the worksheet uses an Excel table, extend the right edge to include dedupe columns
+        # so table styling (header + banded rows) naturally applies to the new columns.
+        for table in worksheet.tables.values():
+            min_col, min_row, max_col, max_row = range_boundaries(table.ref)
+            if min_row != 1:
+                continue
+            if max_col < template_col_idx:
+                continue
+            if dedupe_max_col_idx <= max_col:
+                continue
+            new_ref = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(dedupe_max_col_idx)}{max_row}"
+            table.ref = new_ref
 
         data_row_count = len(cleaned_df)
         for dedupe_col, col_idx in dedupe_column_indexes.items():
