@@ -21,6 +21,22 @@ from dedupe_engine import (
 )
 
 APP_TITLE = "Duplicate Review MVP v3"
+AUTO_GROUP_COLUMNS = [
+    "auto_group_id",
+    "auto_group_key",
+    "strict_name_key",
+    "canonical_name",
+    "member_count",
+    "member_names",
+    "members_list",
+    "reasons",
+    "confidence",
+    "total_rows",
+    "min_year",
+    "max_year",
+    "units",
+    "vessel_types",
+]
 
 def init_state():
     defaults = {
@@ -47,6 +63,15 @@ def reset_decision_state():
     st.session_state["queue_settings_fingerprint"] = None
     if "pair_decisions" in st.session_state:
         st.session_state["pair_decisions"] = {}
+
+def ensure_auto_group_schema(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame(columns=AUTO_GROUP_COLUMNS)
+    out = df.copy()
+    for col in AUTO_GROUP_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.Series(dtype=object)
+    return out[AUTO_GROUP_COLUMNS]
 
 @st.cache_data(show_spinner=False)
 def load_sheet_names(file_bytes: bytes):
@@ -115,7 +140,12 @@ def app():
             help="Filters generated pairs by combined evidence score. Lower this if generated pairs are hidden.",
         )
         st.subheader("Review")
-        hide_reviewed_candidates = st.checkbox("Hide reviewed candidates", value=True, key="hide_reviewed_candidates_checkbox")
+        hide_reviewed_candidates = st.checkbox(
+            "Hide reviewed candidates",
+            value=True,
+            key="hide_reviewed_candidates_checkbox",
+            help="When ON, reviewed items are hidden from the current queue; when OFF, reviewed items stay visible.",
+        )
         sample_rows = st.slider("Evidence rows per side", 3, 12, 5, 1, key="evidence_rows_per_side_slider")
         st.subheader("Danger / reset")
         if st.button("Reset all decisions", use_container_width=True, key="reset_all_decisions_button"):
@@ -176,10 +206,15 @@ def app():
     with st.sidebar:
         st.subheader("Column mapping")
         entity_default = saved_config.get("entity_column") if saved_config.get("entity_column") in available_cols else default_entity
-        entity_select_kwargs = {"key": "entity_column_select"}
-        if not pending_loaded_session:
-            entity_select_kwargs["index"] = available_cols.index(entity_default)
-        entity_column = st.selectbox("Primary column to deduplicate/review", available_cols, **entity_select_kwargs)
+        if pending_loaded_session:
+            entity_column = st.selectbox("Primary column to deduplicate/review", available_cols, key="entity_column_select")
+        else:
+            entity_column = st.selectbox(
+                "Primary column to deduplicate/review",
+                available_cols,
+                index=available_cols.index(entity_default),
+                key="entity_column_select",
+            )
         optional_options = ["(None)"] + available_cols
         def optional_select(label, cfg_key, widget_key):
             from_saved = saved_config.get(cfg_key)
@@ -187,10 +222,9 @@ def app():
                 default_val = from_saved
             else:
                 default_val = SHIP_DEFAULTS[cfg_key] if SHIP_DEFAULTS[cfg_key] in available_cols else "(None)"
-            select_kwargs = {"key": widget_key}
-            if not pending_loaded_session:
-                select_kwargs["index"] = optional_options.index(default_val)
-            return st.selectbox(label, optional_options, **select_kwargs)
+            if pending_loaded_session:
+                return st.selectbox(label, optional_options, key=widget_key)
+            return st.selectbox(label, optional_options, index=optional_options.index(default_val), key=widget_key)
         year_column = optional_select("Year/date column (optional)", "year_column", "year_column_select")
         type_column = optional_select("Type/category column (optional)", "type_column", "type_column_select")
         amount_column = optional_select("Amount column (optional)", "amount_column", "amount_column_select")
@@ -212,6 +246,7 @@ def app():
     st.session_state["column_config"] = column_config
 
     raw_df, rows_df, stats_df, auto_groups_df = build_base_data(file_bytes, sheet_name, column_config)
+    auto_groups_df = ensure_auto_group_schema(auto_groups_df)
     load_session_feedback = st.session_state.pop("load_session_feedback", None)
     if load_session_feedback:
         level, message = load_session_feedback
@@ -222,6 +257,8 @@ def app():
 
     if pd.api.types.is_numeric_dtype(raw_df[column_config["entity_column"]]):
         st.warning("This column looks numeric. The tool works best for text/entity columns such as names, places, categories, or labels.")
+        st.info("Choose a text/entity column in Sidebar -> Column mapping to continue.")
+        st.stop()
 
     resolved_names = resolved_names_from_auto(auto_groups_df, st.session_state["auto_status"])
     active_manual_decisions = active_manual_decisions_for_config(st.session_state["manual_decisions"], column_config)
@@ -367,6 +404,7 @@ def app():
             st.markdown(f"**Members:** {row['member_names']}")
             st.markdown(f"**Units:** {row['units'] or '—'}")
             st.markdown(f"**Vessel types:** {row['vessel_types'] or '—'}")
+            st.caption(f"Evidence rows per side slider is set to {sample_rows}.")
 
             preview = auto_preview_df[["auto_group_id", "auto_group_key", "canonical_name", "member_count", "total_rows", "reasons", "status"]].copy()
             st.dataframe(preview, use_container_width=True, hide_index=True)
@@ -443,8 +481,14 @@ def app():
             id_candidates = ["OID", "Volume", "Page", "Day", "Month", "Year", "Entry no."]
             display_columns = [c for c in selected_cols + id_candidates if c and c in raw_df.columns]
             display_columns = list(dict.fromkeys(display_columns))
-            left_rows = raw_df[raw_df[column_config["entity_column"]].fillna("").astype(str).str.strip() == row["name_a"]][display_columns].head(sample_rows)
-            right_rows = raw_df[raw_df[column_config["entity_column"]].fillna("").astype(str).str.strip() == row["name_b"]][display_columns].head(sample_rows)
+            left_all_rows = raw_df[raw_df[column_config["entity_column"]].fillna("").astype(str).str.strip() == row["name_a"]][display_columns]
+            right_all_rows = raw_df[raw_df[column_config["entity_column"]].fillna("").astype(str).str.strip() == row["name_b"]][display_columns]
+            left_rows = left_all_rows.head(sample_rows)
+            right_rows = right_all_rows.head(sample_rows)
+            st.caption(
+                f"Showing up to {sample_rows} evidence rows per side live. "
+                f"Side A total rows: {len(left_all_rows)}. Side B total rows: {len(right_all_rows)}."
+            )
 
             previews = st.columns(2)
             with previews[0]:
