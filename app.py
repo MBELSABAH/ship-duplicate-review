@@ -1,5 +1,6 @@
 import io
 import json
+import hashlib
 
 import pandas as pd
 import streamlit as st
@@ -22,6 +23,10 @@ from dedupe_engine import (
 )
 
 APP_TITLE = "Duplicate Review MVP v3"
+SESSION_SCHEMA_VERSION = 1
+VALID_AUTO_STATUSES = {"accepted", "rejected"}
+VALID_MANUAL_DECISIONS = {"merge", "keep_separate", "unsure"}
+REQUIRED_MANUAL_DECISION_FIELDS = {"pair_key", "entity_column", "name_a", "name_b", "decision"}
 AUTO_GROUP_COLUMNS = [
     "auto_group_id",
     "auto_group_key",
@@ -88,11 +93,87 @@ def build_base_data(file_bytes: bytes, sheet_name: str, column_config: dict):
     auto_groups_df = build_safe_auto_groups(stats_df, column_config["entity_column"])
     return raw_df, rows_df, stats_df, auto_groups_df
 
-def build_session_payload(sheet_name: str, column_config: dict):
+@st.cache_data(show_spinner=False)
+def sheet_fingerprint(file_bytes: bytes, sheet_name: str) -> dict:
+    raw_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name)
+    row_count = int(len(raw_df))
+    columns = [str(col) for col in raw_df.columns.tolist()]
+    sample_rows_per_side = 25
+    if row_count > sample_rows_per_side * 2:
+        sample_df = pd.concat([raw_df.head(sample_rows_per_side), raw_df.tail(sample_rows_per_side)], ignore_index=True)
+    else:
+        sample_df = raw_df.copy()
+    sample_df = sample_df.reindex(columns=raw_df.columns)
+    normalized_sample = sample_df.where(sample_df.notna(), "__NA__").astype(str)
+    sample_row_hashes = [int(x) for x in pd.util.hash_pandas_object(normalized_sample, index=False).tolist()]
+    sample_hash = hashlib.sha256(",".join(str(x) for x in sample_row_hashes).encode("utf-8")).hexdigest()
+    fingerprint_input = {
+        "sheet_name": sheet_name,
+        "row_count": row_count,
+        "columns": columns,
+        "sample_size": int(len(sample_df)),
+        "sample_hash": sample_hash,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_input, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
     return {
+        "algorithm": "sheet-v1-sha256",
+        "sheet_name": sheet_name,
+        "row_count": row_count,
+        "columns": columns,
+        "sample_size": int(len(sample_df)),
+        "sample_hash": sample_hash,
+        "fingerprint": fingerprint,
+    }
+
+def validate_session_payload(data: object) -> tuple[bool, str, dict]:
+    if not isinstance(data, dict):
+        return False, "Invalid session format. The JSON root must be an object.", {}
+    column_config = data.get("column_config")
+    auto_status = data.get("auto_status")
+    manual_decisions = data.get("manual_decisions")
+    if not isinstance(column_config, dict):
+        return False, "Invalid session format. `column_config` must be an object.", {}
+    if not isinstance(auto_status, dict):
+        return False, "Invalid session format. `auto_status` must be an object.", {}
+    if not isinstance(manual_decisions, dict):
+        return False, "Invalid session format. `manual_decisions` must be an object.", {}
+    for group_key, status in auto_status.items():
+        if status not in VALID_AUTO_STATUSES:
+            return False, f"Invalid session format. auto_status entry `{group_key}` has invalid value `{status}`.", {}
+    for pair_key, record in manual_decisions.items():
+        if not isinstance(record, dict):
+            return False, f"Invalid session format. manual_decisions entry `{pair_key}` must be an object.", {}
+        missing_fields = [field for field in REQUIRED_MANUAL_DECISION_FIELDS if field not in record]
+        if missing_fields:
+            return False, (
+                f"Invalid session format. manual_decisions entry `{pair_key}` is missing required fields: "
+                + ", ".join(sorted(missing_fields))
+                + "."
+            ), {}
+        decision = record.get("decision")
+        if decision not in VALID_MANUAL_DECISIONS:
+            return False, f"Invalid session format. manual_decisions entry `{pair_key}` has invalid decision `{decision}`.", {}
+    return True, "", data
+
+def build_session_payload(
+    source_filename: str,
+    workbook_bytes: bytes,
+    sheet_name: str,
+    raw_df: pd.DataFrame,
+    column_config: dict,
+):
+    fingerprint = sheet_fingerprint(workbook_bytes, sheet_name)
+    return {
+        "session_schema_version": SESSION_SCHEMA_VERSION,
         "app_version": "v3-stable-decisions-session",
         "saved_at": now_iso(),
+        "source_filename": source_filename,
         "sheet_name": sheet_name,
+        "sheet_row_count": int(len(raw_df)),
+        "sheet_columns": [str(col) for col in raw_df.columns.tolist()],
+        "sheet_fingerprint": fingerprint,
         "column_config": column_config,
         "auto_status": st.session_state.get("auto_status", {}),
         "manual_decisions": st.session_state.get("manual_decisions", {}),
@@ -162,8 +243,15 @@ def app():
     pending_loaded_session = st.session_state.pop("pending_loaded_session", None)
     if pending_loaded_session:
         pending_sheet = pending_loaded_session.get("sheet_name")
-        if pending_sheet in sheet_names:
-            st.session_state["sheet_select"] = pending_sheet
+        if pending_sheet:
+            if pending_sheet in sheet_names:
+                st.session_state["sheet_select"] = pending_sheet
+            else:
+                st.session_state["load_session_feedback"] = (
+                    "error",
+                    f"This session was saved for sheet `{pending_sheet}`, but that sheet is not in the uploaded workbook. Session was not loaded.",
+                )
+                pending_loaded_session = None
 
     with st.sidebar:
         sheet_name = st.selectbox("Sheet", sheet_names, index=0, key="sheet_select")
@@ -174,34 +262,80 @@ def app():
     default_entity = SHIP_DEFAULTS["entity_column"] if SHIP_DEFAULTS["entity_column"] in available_cols else (text_candidates[0] if text_candidates else available_cols[0])
     if pending_loaded_session:
         saved_cfg = pending_loaded_session.get("column_config", {}) if isinstance(pending_loaded_session.get("column_config", {}), dict) else {}
-        missing_cols = [v for v in saved_cfg.values() if v and v not in available_cols]
-        mapping_to_widget = {
-            "entity_column": "entity_column_select",
-            "year_column": "year_column_select",
-            "type_column": "type_column_select",
-            "amount_column": "amount_column_select",
-            "unit_column": "unit_column_select",
-            "notes_column_1": "notes_column_1_select",
-            "notes_column_2": "notes_column_2_select",
-        }
-        for cfg_key, widget_key in mapping_to_widget.items():
-            value = saved_cfg.get(cfg_key)
-            fallback = default_entity if cfg_key == "entity_column" else "(None)"
-            if value in available_cols:
-                st.session_state[widget_key] = value
-            else:
-                st.session_state[widget_key] = fallback
-        st.session_state["column_config"] = saved_cfg
-        st.session_state["auto_status"] = pending_loaded_session.get("auto_status", {})
-        st.session_state["manual_decisions"] = pending_loaded_session.get("manual_decisions", {})
-        st.session_state["auto_index"] = 0
-        st.session_state["pair_index"] = 0
-        st.session_state["queue_settings_fingerprint"] = None
-        if missing_cols:
-            msg = f"Loaded session. Some saved columns are missing in the current sheet: {', '.join(sorted(set(missing_cols)))}. Current mapping fallback was used where needed."
-            st.session_state["load_session_feedback"] = ("warning", msg)
+        saved_entity_column = saved_cfg.get("entity_column")
+        if not saved_entity_column or saved_entity_column not in available_cols:
+            st.session_state["load_session_feedback"] = (
+                "error",
+                f"The saved primary/entity column `{saved_entity_column}` is missing from the uploaded sheet. Session was not loaded.",
+            )
+            pending_loaded_session = None
         else:
-            st.session_state["load_session_feedback"] = ("success", "Review session loaded.")
+            saved_sheet_fingerprint = pending_loaded_session.get("sheet_fingerprint")
+            has_saved_fingerprint = isinstance(saved_sheet_fingerprint, dict) and bool(saved_sheet_fingerprint.get("fingerprint"))
+            fingerprint_is_valid = True
+            older_session_warning = False
+            if has_saved_fingerprint:
+                current_sheet_fingerprint = sheet_fingerprint(file_bytes, sheet_name)
+                fingerprint_is_valid = (
+                    saved_sheet_fingerprint.get("fingerprint") == current_sheet_fingerprint.get("fingerprint")
+                )
+                saved_row_count = pending_loaded_session.get("sheet_row_count")
+                if isinstance(saved_row_count, int):
+                    fingerprint_is_valid = fingerprint_is_valid and saved_row_count == current_sheet_fingerprint.get("row_count")
+                saved_columns = pending_loaded_session.get("sheet_columns")
+                if isinstance(saved_columns, list):
+                    normalized_saved_columns = [str(col) for col in saved_columns]
+                    fingerprint_is_valid = fingerprint_is_valid and normalized_saved_columns == current_sheet_fingerprint.get("columns", [])
+            else:
+                older_session_warning = True
+
+            if not fingerprint_is_valid:
+                st.session_state["load_session_feedback"] = (
+                    "error",
+                    "This session does not appear to match the uploaded workbook/sheet. Session was not loaded.",
+                )
+                pending_loaded_session = None
+            else:
+                missing_optional_cols = [
+                    value
+                    for cfg_key, value in saved_cfg.items()
+                    if cfg_key != "entity_column" and value and value not in available_cols
+                ]
+                mapping_to_widget = {
+                    "entity_column": "entity_column_select",
+                    "year_column": "year_column_select",
+                    "type_column": "type_column_select",
+                    "amount_column": "amount_column_select",
+                    "unit_column": "unit_column_select",
+                    "notes_column_1": "notes_column_1_select",
+                    "notes_column_2": "notes_column_2_select",
+                }
+                for cfg_key, widget_key in mapping_to_widget.items():
+                    value = saved_cfg.get(cfg_key)
+                    fallback = default_entity if cfg_key == "entity_column" else "(None)"
+                    if value in available_cols:
+                        st.session_state[widget_key] = value
+                    else:
+                        st.session_state[widget_key] = fallback
+                st.session_state["column_config"] = saved_cfg
+                st.session_state["auto_status"] = pending_loaded_session.get("auto_status", {})
+                st.session_state["manual_decisions"] = pending_loaded_session.get("manual_decisions", {})
+                st.session_state["auto_index"] = 0
+                st.session_state["pair_index"] = 0
+                st.session_state["queue_settings_fingerprint"] = None
+                feedback_messages = []
+                if older_session_warning:
+                    feedback_messages.append("This looks like an older session file without workbook fingerprint metadata. Loaded with caution.")
+                if missing_optional_cols:
+                    feedback_messages.append(
+                        "Loaded session. Some saved columns are missing in the current sheet: "
+                        + ", ".join(sorted(set(missing_optional_cols)))
+                        + ". Current mapping fallback was used where needed."
+                    )
+                if feedback_messages:
+                    st.session_state["load_session_feedback"] = ("warning", " ".join(feedback_messages))
+                else:
+                    st.session_state["load_session_feedback"] = ("success", "Review session loaded.")
 
     saved_config = st.session_state.get("column_config", {}) or {}
     with st.sidebar:
@@ -253,6 +387,8 @@ def app():
         level, message = load_session_feedback
         if level == "warning":
             st.warning(message)
+        elif level == "error":
+            st.error(message)
         else:
             st.success(message)
 
@@ -294,6 +430,13 @@ def app():
     stat_lookup = stats_df.set_index("raw_name").to_dict("index")
 
     visible_auto_count = len(auto_groups_df[auto_groups_df["auto_group_key"].map(lambda gid: st.session_state["auto_status"].get(gid, "pending")) == "pending"]) if hide_reviewed_candidates else len(auto_groups_df)
+    current_auto_group_keys = set(auto_groups_df["auto_group_key"].tolist()) if not auto_groups_df.empty else set()
+    active_auto_decision_count = sum(
+        1
+        for gid, status in st.session_state["auto_status"].items()
+        if gid in current_auto_group_keys and status in VALID_AUTO_STATUSES
+    )
+    active_decision_count = len(active_manual_decisions) + active_auto_decision_count
     merged_count = sum(1 for x in active_manual_decisions.values() if x.get("decision") == "merge")
     separate_count = sum(1 for x in active_manual_decisions.values() if x.get("decision") == "keep_separate")
     unsure_count = sum(1 for x in active_manual_decisions.values() if x.get("decision") == "unsure")
@@ -301,7 +444,7 @@ def app():
     dashboard1[0].metric("Unique primary values", len(stats_df))
     dashboard1[1].metric("Safe auto-groups visible / total", f"{visible_auto_count} / {len(auto_groups_df)}")
     dashboard1[2].metric("Manual candidates visible / generated", f"{len(visible_queue_df)} / {len(full_queue_df)}")
-    dashboard1[3].metric("Decisions saved", len(st.session_state["manual_decisions"]) + len(st.session_state["auto_status"]))
+    dashboard1[3].metric("Decisions saved", active_decision_count)
     dashboard1[4].metric("Active merged names", len(mapping_df))
     dashboard2 = st.columns(3)
     dashboard2[0].metric("Merged", merged_count)
@@ -596,7 +739,14 @@ def app():
             auto_export["members"] = auto_export["members_list"].map(lambda x: " | ".join(x))
             auto_export["members_list"] = auto_export["members_list"].map(lambda x: " | ".join(x))
         pair_export = pd.DataFrame(st.session_state["manual_decisions"].values())
-        session_payload = build_session_payload(sheet_name, column_config)
+        source_filename = getattr(uploaded, "name", "") or "uploaded_workbook.xlsx"
+        session_payload = build_session_payload(
+            source_filename=source_filename,
+            workbook_bytes=file_bytes,
+            sheet_name=sheet_name,
+            raw_df=raw_df,
+            column_config=column_config,
+        )
         session_bytes = json.dumps(session_payload, indent=2).encode("utf-8")
         uploaded_session = st.file_uploader("Upload review session JSON", type=["json"], key="session_upload")
         if st.button("Load review session", use_container_width=False, key="load_review_session_button"):
@@ -605,13 +755,14 @@ def app():
             else:
                 try:
                     data = json.loads(uploaded_session.getvalue().decode("utf-8"))
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, UnicodeDecodeError):
                     st.warning("Invalid JSON file. Please upload a valid review session JSON.")
                 else:
-                    if not isinstance(data, dict):
-                        st.warning("Invalid session format. The JSON root must be an object.")
+                    is_valid, validation_message, normalized_session = validate_session_payload(data)
+                    if not is_valid:
+                        st.warning(validation_message)
                     else:
-                        st.session_state["pending_loaded_session"] = data
+                        st.session_state["pending_loaded_session"] = normalized_session
                         st.rerun()
 
         base_name = getattr(uploaded, "name", "") or "cleaned_duplicate_review.xlsx"
@@ -645,8 +796,14 @@ def app():
         st.download_button("Download standardized workbook", standardized_bytes, standardized_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, key="download_standardized_workbook")
         st.caption("This export replaces the selected entity column with reviewed canonical values only. It does not add audit columns.")
         with st.expander("Continue later", expanded=True):
-            session_actions = st.columns([1, 1.2])
-            session_actions[0].download_button("Download review session JSON", session_bytes, "ship_review_session.json", "application/json", use_container_width=True, key="download_review_session_json")
+            st.download_button(
+                "Download review session JSON",
+                session_bytes,
+                "ship_review_session.json",
+                "application/json",
+                use_container_width=True,
+                key="download_review_session_json",
+            )
         with st.expander("Audit exports", expanded=True):
             st.download_button("auto decisions CSV", make_download_bytes(auto_export if not auto_export.empty else pd.DataFrame()), "ship_auto_merge_decisions.csv", "text/csv", use_container_width=True, key="download_auto_decisions_csv")
             st.download_button("manual decisions CSV", make_download_bytes(pair_export if not pair_export.empty else pd.DataFrame()), "ship_manual_review_decisions.csv", "text/csv", use_container_width=True, key="download_manual_decisions_csv")
