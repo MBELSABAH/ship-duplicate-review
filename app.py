@@ -551,8 +551,10 @@ def app():
         base_name = getattr(uploaded, "name", "") or "cleaned_duplicate_review.xlsx"
         if base_name.lower().endswith(".xlsx"):
             cleaned_name = f"{base_name[:-5]}_reviewed.xlsx"
+            standardized_name = f"{base_name[:-5]}_standardized.xlsx"
         else:
             cleaned_name = "cleaned_duplicate_review.xlsx"
+            standardized_name = "standardized_duplicate_review.xlsx"
         cleaned_bytes = build_cleaned_workbook_bytes(
             raw_df=raw_df,
             mapping_df=mapping_df,
@@ -564,9 +566,23 @@ def app():
             workbook_bytes=file_bytes,
             candidate_queue_df=score_filtered_queue_df,
         )
+        standardized_bytes = build_cleaned_workbook_bytes(
+            raw_df=raw_df,
+            mapping_df=mapping_df,
+            history_df=history_df,
+            manual_decisions=active_manual_decisions,
+            auto_groups_df=auto_groups_df,
+            column_config=column_config,
+            sheet_name=sheet_name,
+            workbook_bytes=file_bytes,
+            candidate_queue_df=score_filtered_queue_df,
+            overwrite_entity_column=True,
+        )
         st.markdown("#### Primary export")
         st.download_button("Download cleaned workbook", cleaned_bytes, cleaned_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, key="download_cleaned_workbook")
         st.caption("Exports a reviewed copy of the workbook. The original uploaded file is not overwritten.")
+        st.download_button("Download standardized workbook", standardized_bytes, standardized_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, key="download_standardized_workbook")
+        st.caption("This export replaces the selected entity column with reviewed canonical values while keeping audit columns.")
         with st.expander("Continue later", expanded=True):
             session_actions = st.columns([1, 1.2])
             session_actions[0].download_button("Download review session JSON", session_bytes, "ship_review_session.json", "application/json", use_container_width=True, key="download_review_session_json")
