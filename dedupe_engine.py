@@ -2,13 +2,11 @@ import io
 import itertools
 import hashlib
 import re
-from copy import copy
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
 from rapidfuzz import fuzz
 
 
@@ -434,88 +432,55 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
         return value
 
     if workbook_bytes:
-        try:
-            workbook = load_workbook(io.BytesIO(workbook_bytes))
-            if sheet_name not in workbook.sheetnames:
-                raise KeyError(f'Sheet not found: {sheet_name}')
-            worksheet = workbook[sheet_name]
+        workbook = load_workbook(io.BytesIO(workbook_bytes))
+        if sheet_name not in workbook.sheetnames:
+            raise KeyError(f'Sheet not found: {sheet_name}')
+        worksheet = workbook[sheet_name]
 
-            def normalize_header(value):
-                return value.strip() if isinstance(value, str) else value
+        def normalize_header(value):
+            return value.strip() if isinstance(value, str) else value
 
-            header_map = {}
-            for col_idx in range(1, worksheet.max_column + 1):
-                header_value = worksheet.cell(row=1, column=col_idx).value
-                key = normalize_header(header_value)
-                if key is not None:
-                    header_map[key] = col_idx
+        header_map = {}
+        for col_idx in range(1, worksheet.max_column + 1):
+            header_value = worksheet.cell(row=1, column=col_idx).value
+            key = normalize_header(header_value)
+            if key is not None:
+                header_map[key] = col_idx
 
-            dedupe_column_indexes = {}
-            data_row_count = len(cleaned_df)
-            last_data_row = data_row_count + 1
-
-            for dedupe_col in dedupe_columns:
-                existing_idx = header_map.get(dedupe_col)
-                if existing_idx is not None:
-                    dedupe_column_indexes[dedupe_col] = existing_idx
-                    continue
-
+        dedupe_column_indexes = {}
+        for dedupe_col in dedupe_columns:
+            existing_idx = header_map.get(dedupe_col)
+            if existing_idx is not None:
+                dedupe_column_indexes[dedupe_col] = existing_idx
+            else:
                 new_idx = worksheet.max_column + 1
                 dedupe_column_indexes[dedupe_col] = new_idx
-                template_idx = new_idx - 1 if new_idx > 1 else 1
+                worksheet.cell(row=1, column=new_idx, value=dedupe_col)
 
-                header_cell = worksheet.cell(row=1, column=new_idx, value=dedupe_col)
-                template_header = worksheet.cell(row=1, column=template_idx)
-                if template_header.has_style:
-                    header_cell._style = copy(template_header._style)
+        data_row_count = len(cleaned_df)
+        for dedupe_col, col_idx in dedupe_column_indexes.items():
+            values = cleaned_df[dedupe_col].tolist()
+            for row_idx, value in enumerate(values):
+                excel_row = row_idx + 2
+                worksheet.cell(row=excel_row, column=col_idx, value=to_excel_value(value))
 
-                template_letter = get_column_letter(template_idx)
-                new_letter = get_column_letter(new_idx)
-                template_dim = worksheet.column_dimensions.get(template_letter)
-                if template_dim is not None:
-                    new_dim = worksheet.column_dimensions[new_letter]
-                    new_dim.width = template_dim.width
-                    new_dim.hidden = template_dim.hidden
-                    new_dim.outlineLevel = template_dim.outlineLevel
-                    new_dim.collapsed = template_dim.collapsed
+            clear_start = data_row_count + 2
+            if clear_start <= worksheet.max_row:
+                for excel_row in range(clear_start, worksheet.max_row + 1):
+                    worksheet.cell(row=excel_row, column=col_idx, value=None)
 
-                for excel_row in range(2, last_data_row + 1):
-                    source_cell = worksheet.cell(row=excel_row, column=template_idx)
-                    target_cell = worksheet.cell(row=excel_row, column=new_idx)
-                    if source_cell.has_style:
-                        target_cell._style = copy(source_cell._style)
-
-            for dedupe_col, col_idx in dedupe_column_indexes.items():
-                values = cleaned_df[dedupe_col].tolist()
+        if overwrite_entity_column:
+            raw_columns = raw_df.columns.tolist()
+            if entity_col in raw_columns:
+                entity_col_idx = raw_columns.index(entity_col) + 1
+                values = cleaned_df['dedupe_canonical_value'].tolist()
                 for row_idx, value in enumerate(values):
                     excel_row = row_idx + 2
-                    worksheet.cell(row=excel_row, column=col_idx, value=to_excel_value(value))
+                    worksheet.cell(row=excel_row, column=entity_col_idx, value=to_excel_value(value))
 
-                clear_start = data_row_count + 2
-                if clear_start <= worksheet.max_row:
-                    for excel_row in range(clear_start, worksheet.max_row + 1):
-                        worksheet.cell(row=excel_row, column=col_idx, value=None)
-
-            if overwrite_entity_column:
-                raw_columns = raw_df.columns.tolist()
-                entity_col_idx = raw_columns.index(entity_col) + 1 if entity_col in raw_columns else header_map.get(entity_col)
-                if entity_col_idx is not None:
-                    values = cleaned_df['dedupe_canonical_value'].tolist()
-                    for row_idx, value in enumerate(values):
-                        excel_row = row_idx + 2
-                        worksheet.cell(row=excel_row, column=entity_col_idx, value=to_excel_value(value))
-
-            out = io.BytesIO()
-            workbook.save(out)
-            return out.getvalue()
-        except Exception:
-            all_sheets = pd.read_excel(io.BytesIO(workbook_bytes), sheet_name=None)
-            all_sheets[sheet_name] = cleaned_df
-            out = io.BytesIO()
-            with pd.ExcelWriter(out, engine='openpyxl') as writer:
-                for name, df in all_sheets.items():
-                    df.to_excel(writer, sheet_name=name, index=False)
-            return out.getvalue()
+        out = io.BytesIO()
+        workbook.save(out)
+        return out.getvalue()
 
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine='openpyxl') as writer:
