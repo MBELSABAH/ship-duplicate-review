@@ -2,10 +2,16 @@ import io
 import itertools
 import hashlib
 import re
+from copy import copy
+from math import ceil
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, range_boundaries
+from openpyxl.worksheet.filters import AutoFilter
+from openpyxl.worksheet.table import TableColumn
 from rapidfuzz import fuzz
 
 
@@ -408,19 +414,227 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
         return 'not_flagged'
     missing_status = cleaned_df['dedupe_review_status'].isna() | (cleaned_df['dedupe_review_status'] == '')
     cleaned_df.loc[missing_status, 'dedupe_review_status'] = normalized_original_values[missing_status].map(default_status)
+
+    dedupe_columns = [
+        'dedupe_entity_column',
+        'dedupe_original_value',
+        'dedupe_canonical_value',
+        'dedupe_cluster_id',
+        'dedupe_review_status',
+        'dedupe_decision_source',
+        'dedupe_score',
+        'dedupe_reason',
+    ]
+
     if overwrite_entity_column:
         cleaned_df[entity_col] = cleaned_df['dedupe_canonical_value']
+
+    def to_excel_value(value):
+        if pd.isna(value):
+            return None
+        if isinstance(value, pd.Timestamp):
+            return value.to_pydatetime()
+        return value
+
     if workbook_bytes:
-        all_sheets = pd.read_excel(io.BytesIO(workbook_bytes), sheet_name=None)
-        all_sheets[sheet_name] = cleaned_df
+        workbook = load_workbook(io.BytesIO(workbook_bytes))
+        if sheet_name not in workbook.sheetnames:
+            raise KeyError(f'Sheet not found: {sheet_name}')
+        worksheet = workbook[sheet_name]
+
+        def normalize_header(value):
+            return value.strip() if isinstance(value, str) else value
+
+        header_map = {}
+        for col_idx in range(1, worksheet.max_column + 1):
+            header_value = worksheet.cell(row=1, column=col_idx).value
+            key = normalize_header(header_value)
+            if key is not None:
+                header_map[key] = col_idx
+
+        existing_dedupe_indexes = [header_map.get(col) for col in dedupe_columns if header_map.get(col) is not None]
+        if existing_dedupe_indexes:
+            template_col_idx = max(1, min(existing_dedupe_indexes) - 1)
+        else:
+            template_col_idx = max(1, worksheet.max_column)
+        template_letter = get_column_letter(template_col_idx)
+        template_dim = worksheet.column_dimensions.get(template_letter)
+
+        dedupe_column_indexes = {}
+        for dedupe_col in dedupe_columns:
+            existing_idx = header_map.get(dedupe_col)
+            if existing_idx is not None:
+                dedupe_column_indexes[dedupe_col] = existing_idx
+            else:
+                new_idx = worksheet.max_column + 1
+                dedupe_column_indexes[dedupe_col] = new_idx
+                worksheet.cell(row=1, column=new_idx, value=dedupe_col)
+                if template_dim is not None:
+                    new_letter = get_column_letter(new_idx)
+                    worksheet.column_dimensions[new_letter].width = template_dim.width
+
+        dedupe_max_col_idx = max(dedupe_column_indexes.values()) if dedupe_column_indexes else worksheet.max_column
+
+        # If the worksheet uses an Excel table, extend the right edge to include dedupe columns
+        # so table styling (header + banded rows) naturally applies to the new columns.
+        for table in worksheet.tables.values():
+            min_col, min_row, max_col, max_row = range_boundaries(table.ref)
+            if min_row != 1:
+                continue
+            if max_col < template_col_idx:
+                continue
+            if dedupe_max_col_idx <= max_col:
+                continue
+            new_ref = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(dedupe_max_col_idx)}{max_row}"
+            table.ref = new_ref
+            if table.autoFilter is None:
+                table.autoFilter = AutoFilter(ref=new_ref)
+            else:
+                table.autoFilter.ref = new_ref
+
+            total_cols = dedupe_max_col_idx - min_col + 1
+            existing_cols = list(table.tableColumns)
+            updated_cols = []
+            for position in range(total_cols):
+                col_idx = min_col + position
+                header_value = worksheet.cell(row=min_row, column=col_idx).value
+                if header_value is None or str(header_value).strip() == '':
+                    column_name = f'Column{position + 1}'
+                else:
+                    column_name = str(header_value)
+                if position < len(existing_cols):
+                    col_obj = existing_cols[position]
+                    col_obj.id = position + 1
+                    col_obj.name = column_name
+                else:
+                    col_obj = TableColumn(id=position + 1, name=column_name)
+                updated_cols.append(col_obj)
+            table.tableColumns = updated_cols
+
+        data_row_count = len(cleaned_df)
+        for dedupe_col, col_idx in dedupe_column_indexes.items():
+            template_header = worksheet.cell(row=1, column=template_col_idx)
+            target_header = worksheet.cell(row=1, column=col_idx)
+            if template_header.has_style:
+                target_header._style = copy(template_header._style)
+
+            for row_idx in range(data_row_count):
+                excel_row = row_idx + 2
+                template_cell = worksheet.cell(row=excel_row, column=template_col_idx)
+                target_cell = worksheet.cell(row=excel_row, column=col_idx)
+                if template_cell.has_style:
+                    target_cell._style = copy(template_cell._style)
+
+            values = cleaned_df[dedupe_col].tolist()
+            for row_idx, value in enumerate(values):
+                excel_row = row_idx + 2
+                worksheet.cell(row=excel_row, column=col_idx, value=to_excel_value(value))
+
+            clear_start = data_row_count + 2
+            if clear_start <= worksheet.max_row:
+                for excel_row in range(clear_start, worksheet.max_row + 1):
+                    worksheet.cell(row=excel_row, column=col_idx, value=None)
+
+        if overwrite_entity_column:
+            raw_columns = raw_df.columns.tolist()
+            if entity_col in raw_columns:
+                entity_col_idx = raw_columns.index(entity_col) + 1
+                values = cleaned_df['dedupe_canonical_value'].tolist()
+                for row_idx, value in enumerate(values):
+                    excel_row = row_idx + 2
+                    worksheet.cell(row=excel_row, column=entity_col_idx, value=to_excel_value(value))
+
+        def autofit_columns_and_rows(ws):
+            min_width = 8.0
+            max_width = 80.0
+            col_width_map = {}
+            max_row = ws.max_row
+            max_col = ws.max_column
+
+            for col_idx in range(1, max_col + 1):
+                max_len = 0
+                for row_idx in range(1, max_row + 1):
+                    cell_value = ws.cell(row=row_idx, column=col_idx).value
+                    if cell_value is None:
+                        continue
+                    text = str(cell_value)
+                    longest_segment = max((len(segment) for segment in text.splitlines()), default=0)
+                    if longest_segment > max_len:
+                        max_len = longest_segment
+                width = min(max_width, max(min_width, float(max_len + 2)))
+                ws.column_dimensions[get_column_letter(col_idx)].width = width
+                col_width_map[col_idx] = width
+
+            base_height = ws.sheet_format.defaultRowHeight or 15.0
+            max_height = 180.0
+            for row_idx in range(1, max_row + 1):
+                max_lines = 1
+                for col_idx in range(1, max_col + 1):
+                    cell_value = ws.cell(row=row_idx, column=col_idx).value
+                    if cell_value is None:
+                        continue
+                    text = str(cell_value)
+                    segments = text.splitlines() if text else ['']
+                    usable_width = max(1.0, col_width_map.get(col_idx, min_width) - 2.0)
+                    line_count = 0
+                    for segment in segments:
+                        segment_len = len(segment)
+                        line_count += max(1, int(ceil(segment_len / usable_width)))
+                    if line_count > max_lines:
+                        max_lines = line_count
+                ws.row_dimensions[row_idx].height = min(max_height, float(base_height * max_lines))
+
+        autofit_columns_and_rows(worksheet)
+
         out = io.BytesIO()
-        with pd.ExcelWriter(out, engine='openpyxl') as writer:
-            for name, df in all_sheets.items():
-                df.to_excel(writer, sheet_name=name, index=False)
+        workbook.save(out)
         return out.getvalue()
+
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine='openpyxl') as writer:
         cleaned_df.to_excel(writer, sheet_name=sheet_name, index=False)
+    return out.getvalue()
+
+def build_standardized_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame, column_config: dict, sheet_name: str, workbook_bytes: bytes | None) -> bytes:
+    entity_col = column_config['entity_column']
+    canonical_map = {}
+    if not mapping_df.empty:
+        canonical_map = dict(zip(mapping_df['member_name'], mapping_df['canonical_name']))
+
+    standardized_df = raw_df.copy()
+    standardized_original_values = standardized_df[entity_col].fillna('').astype(str).map(lambda x: str(x).strip())
+    standardized_df[entity_col] = standardized_original_values.map(lambda x: canonical_map.get(x, x))
+
+    def to_excel_value(value):
+        if pd.isna(value):
+            return None
+        if isinstance(value, pd.Timestamp):
+            return value.to_pydatetime()
+        return value
+
+    if workbook_bytes:
+        workbook = load_workbook(io.BytesIO(workbook_bytes))
+        if sheet_name not in workbook.sheetnames:
+            raise KeyError(f'Sheet not found: {sheet_name}')
+        worksheet = workbook[sheet_name]
+
+        raw_columns = raw_df.columns.tolist()
+        if entity_col not in raw_columns:
+            raise KeyError(f'Entity column not found: {entity_col}')
+        entity_col_idx = raw_columns.index(entity_col) + 1
+
+        values = standardized_df[entity_col].tolist()
+        for row_idx, value in enumerate(values):
+            excel_row = row_idx + 2
+            worksheet.cell(row=excel_row, column=entity_col_idx, value=to_excel_value(value))
+
+        out = io.BytesIO()
+        workbook.save(out)
+        return out.getvalue()
+
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine='openpyxl') as writer:
+        standardized_df.to_excel(writer, sheet_name=sheet_name, index=False)
     return out.getvalue()
 
 def now_iso():
