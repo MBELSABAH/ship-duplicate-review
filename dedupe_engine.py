@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter, range_boundaries
+from openpyxl.worksheet.filters import AutoFilter
+from openpyxl.worksheet.table import TableColumn
 from rapidfuzz import fuzz
 
 
@@ -484,6 +486,29 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
                 continue
             new_ref = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(dedupe_max_col_idx)}{max_row}"
             table.ref = new_ref
+            if table.autoFilter is None:
+                table.autoFilter = AutoFilter(ref=new_ref)
+            else:
+                table.autoFilter.ref = new_ref
+
+            total_cols = dedupe_max_col_idx - min_col + 1
+            existing_cols = list(table.tableColumns)
+            updated_cols = []
+            for position in range(total_cols):
+                col_idx = min_col + position
+                header_value = worksheet.cell(row=min_row, column=col_idx).value
+                if header_value is None or str(header_value).strip() == '':
+                    column_name = f'Column{position + 1}'
+                else:
+                    column_name = str(header_value)
+                if position < len(existing_cols):
+                    col_obj = existing_cols[position]
+                    col_obj.id = position + 1
+                    col_obj.name = column_name
+                else:
+                    col_obj = TableColumn(id=position + 1, name=column_name)
+                updated_cols.append(col_obj)
+            table.tableColumns = updated_cols
 
         data_row_count = len(cleaned_df)
         for dedupe_col, col_idx in dedupe_column_indexes.items():
