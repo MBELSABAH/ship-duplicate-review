@@ -2,11 +2,13 @@ import io
 import itertools
 import hashlib
 import re
+from copy import copy
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 import pandas as pd
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 from rapidfuzz import fuzz
 
 
@@ -447,6 +449,14 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
             if key is not None:
                 header_map[key] = col_idx
 
+        existing_dedupe_indexes = [header_map.get(col) for col in dedupe_columns if header_map.get(col) is not None]
+        if existing_dedupe_indexes:
+            template_col_idx = max(1, min(existing_dedupe_indexes) - 1)
+        else:
+            template_col_idx = max(1, worksheet.max_column)
+        template_letter = get_column_letter(template_col_idx)
+        template_dim = worksheet.column_dimensions.get(template_letter)
+
         dedupe_column_indexes = {}
         for dedupe_col in dedupe_columns:
             existing_idx = header_map.get(dedupe_col)
@@ -456,9 +466,24 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
                 new_idx = worksheet.max_column + 1
                 dedupe_column_indexes[dedupe_col] = new_idx
                 worksheet.cell(row=1, column=new_idx, value=dedupe_col)
+                if template_dim is not None:
+                    new_letter = get_column_letter(new_idx)
+                    worksheet.column_dimensions[new_letter].width = template_dim.width
 
         data_row_count = len(cleaned_df)
         for dedupe_col, col_idx in dedupe_column_indexes.items():
+            template_header = worksheet.cell(row=1, column=template_col_idx)
+            target_header = worksheet.cell(row=1, column=col_idx)
+            if template_header.has_style:
+                target_header._style = copy(template_header._style)
+
+            for row_idx in range(data_row_count):
+                excel_row = row_idx + 2
+                template_cell = worksheet.cell(row=excel_row, column=template_col_idx)
+                target_cell = worksheet.cell(row=excel_row, column=col_idx)
+                if template_cell.has_style:
+                    target_cell._style = copy(template_cell._style)
+
             values = cleaned_df[dedupe_col].tolist()
             for row_idx, value in enumerate(values):
                 excel_row = row_idx + 2
