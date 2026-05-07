@@ -347,7 +347,7 @@ def active_manual_decisions_for_config(manual_decisions: dict, column_config: di
 def make_download_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode('utf-8')
 
-def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame, history_df: pd.DataFrame, manual_decisions: dict, auto_groups_df: pd.DataFrame, column_config: dict, sheet_name: str, workbook_bytes: bytes | None=None, candidate_queue_df: pd.DataFrame | None=None) -> bytes:
+def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame, history_df: pd.DataFrame, manual_decisions: dict, auto_groups_df: pd.DataFrame, column_config: dict, sheet_name: str, workbook_bytes: bytes | None=None, candidate_queue_df: pd.DataFrame | None=None, overwrite_entity_column: bool=False) -> bytes:
     entity_col = column_config['entity_column']
     cleaned_df = raw_df.copy()
     original_values = cleaned_df[entity_col].fillna('').astype(str)
@@ -408,6 +408,8 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
         return 'not_flagged'
     missing_status = cleaned_df['dedupe_review_status'].isna() | (cleaned_df['dedupe_review_status'] == '')
     cleaned_df.loc[missing_status, 'dedupe_review_status'] = normalized_original_values[missing_status].map(default_status)
+    if overwrite_entity_column:
+        cleaned_df[entity_col] = cleaned_df['dedupe_canonical_value']
     if workbook_bytes:
         all_sheets = pd.read_excel(io.BytesIO(workbook_bytes), sheet_name=None)
         all_sheets[sheet_name] = cleaned_df
