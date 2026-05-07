@@ -3,6 +3,7 @@ import itertools
 import hashlib
 import re
 from copy import copy
+from math import ceil
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
@@ -542,6 +543,48 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
                 for row_idx, value in enumerate(values):
                     excel_row = row_idx + 2
                     worksheet.cell(row=excel_row, column=entity_col_idx, value=to_excel_value(value))
+
+        def autofit_columns_and_rows(ws):
+            min_width = 8.0
+            max_width = 80.0
+            col_width_map = {}
+            max_row = ws.max_row
+            max_col = ws.max_column
+
+            for col_idx in range(1, max_col + 1):
+                max_len = 0
+                for row_idx in range(1, max_row + 1):
+                    cell_value = ws.cell(row=row_idx, column=col_idx).value
+                    if cell_value is None:
+                        continue
+                    text = str(cell_value)
+                    longest_segment = max((len(segment) for segment in text.splitlines()), default=0)
+                    if longest_segment > max_len:
+                        max_len = longest_segment
+                width = min(max_width, max(min_width, float(max_len + 2)))
+                ws.column_dimensions[get_column_letter(col_idx)].width = width
+                col_width_map[col_idx] = width
+
+            base_height = ws.sheet_format.defaultRowHeight or 15.0
+            max_height = 180.0
+            for row_idx in range(1, max_row + 1):
+                max_lines = 1
+                for col_idx in range(1, max_col + 1):
+                    cell_value = ws.cell(row=row_idx, column=col_idx).value
+                    if cell_value is None:
+                        continue
+                    text = str(cell_value)
+                    segments = text.splitlines() if text else ['']
+                    usable_width = max(1.0, col_width_map.get(col_idx, min_width) - 2.0)
+                    line_count = 0
+                    for segment in segments:
+                        segment_len = len(segment)
+                        line_count += max(1, int(ceil(segment_len / usable_width)))
+                    if line_count > max_lines:
+                        max_lines = line_count
+                ws.row_dimensions[row_idx].height = min(max_height, float(base_height * max_lines))
+
+        autofit_columns_and_rows(worksheet)
 
         out = io.BytesIO()
         workbook.save(out)
