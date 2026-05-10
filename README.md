@@ -149,6 +149,8 @@ http://127.0.0.1:8000/docs
 
 This is an MVP research tool. The core workflow is functional and currently supports generic Excel column mapping, safe auto-merges, manual review, undo, session save/load, formatting-preserving workbook export, and Streamlit Cloud deployment.
 
+Progress report: [MVP Progress Report](docs/mvp_progress_report.md)
+
 Strong next improvements include:
 
 - group-level review instead of only pair-level review
