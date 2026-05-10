@@ -25,6 +25,16 @@ SHIP_DEFAULTS = {
     "notes_column_2": "Notes from transcriber",
 }
 
+EVIDENCE_KIND_OPTIONS = {"categorical", "numeric", "year/date", "text", "auto"}
+LEGACY_EVIDENCE_DEFAULTS = {
+    "year_column": {"kind": "year/date", "weight": 0.10},
+    "type_column": {"kind": "categorical", "weight": 0.08},
+    "amount_column": {"kind": "numeric", "weight": 0.05},
+    "unit_column": {"kind": "categorical", "weight": 0.12},
+    "notes_column_1": {"kind": "text", "weight": 0.03},
+    "notes_column_2": {"kind": "text", "weight": 0.03},
+}
+
 def normalize_spaces(text: str) -> str:
     return re.sub('\\s+', ' ', text).strip()
 
@@ -40,6 +50,141 @@ def clean_name(value: str) -> str:
 
 def stable_hash(text: str, length: int=12) -> str:
     return hashlib.sha1(text.encode('utf-8')).hexdigest()[:length]
+
+def clamp_weight(weight, default: float=0.08) -> float:
+    try:
+        value = float(weight)
+    except Exception:
+        value = default
+    return max(0.0, min(1.0, value))
+
+def infer_evidence_kind_from_series(series: pd.Series, column_name: str='') -> str:
+    name = str(column_name or '').strip().lower()
+    name_has_year_hint = bool(re.search(r'(year|date|day|month)', name))
+    name_has_text_hint = bool(re.search(r'(note|remark|comment|description)', name))
+    if name_has_year_hint:
+        return 'year/date'
+    if pd.api.types.is_numeric_dtype(series):
+        return 'numeric'
+    nonempty = series.dropna().astype(str).str.strip()
+    if nonempty.empty:
+        return 'categorical'
+    parsed_numeric = pd.to_numeric(nonempty, errors='coerce')
+    numeric_ratio = float(parsed_numeric.notna().mean()) if len(parsed_numeric) else 0.0
+    if numeric_ratio >= 0.9 and nonempty.str.contains(r"\d", regex=True).mean() > 0.8:
+        return 'numeric'
+    if name_has_text_hint:
+        return 'text'
+    sample = nonempty.head(200)
+    avg_len = float(sample.map(len).mean()) if len(sample) else 0.0
+    cardinality = float(nonempty.nunique(dropna=True)) / max(1, len(nonempty))
+    if avg_len > 40:
+        return 'text'
+    if cardinality <= 0.2 and nonempty.nunique(dropna=True) <= 50:
+        return 'categorical'
+    return 'text'
+
+def sanitize_evidence_field(field: dict, idx: int=0, infer_kind: str='categorical') -> dict | None:
+    if not isinstance(field, dict):
+        return None
+    column = str(field.get('column') or '').strip()
+    if not column:
+        return None
+    raw_kind = str(field.get('kind') or 'auto').strip().lower()
+    kind = raw_kind if raw_kind in EVIDENCE_KIND_OPTIONS else 'auto'
+    stable_id = str(field.get('id') or f"E{stable_hash(f'{column}::{kind}::{idx}', 10)}")
+    return {
+        'id': stable_id,
+        'column': column,
+        'kind': kind,
+        'resolved_kind': infer_kind if kind == 'auto' else kind,
+        'weight': clamp_weight(field.get('weight'), default=0.08),
+        'enabled': bool(field.get('enabled', True)),
+    }
+
+def normalize_column_config(column_config: dict | None, available_columns: list[str] | None=None) -> dict:
+    cfg = dict(column_config or {})
+    entity_column = cfg.get('entity_column') or SHIP_DEFAULTS['entity_column']
+    evidence_fields = []
+    seen = set()
+    raw_evidence_fields = cfg.get('evidence_fields')
+    if isinstance(raw_evidence_fields, list):
+        for idx, field in enumerate(raw_evidence_fields):
+            clean_field = sanitize_evidence_field(field, idx)
+            if not clean_field:
+                continue
+            key = (clean_field['column'], clean_field['resolved_kind'])
+            if key in seen:
+                continue
+            if available_columns is not None and clean_field['column'] not in available_columns:
+                continue
+            seen.add(key)
+            evidence_fields.append(clean_field)
+    for legacy_key, meta in LEGACY_EVIDENCE_DEFAULTS.items():
+        legacy_col = cfg.get(legacy_key)
+        if not legacy_col:
+            continue
+        legacy_col = str(legacy_col).strip()
+        if not legacy_col:
+            continue
+        if available_columns is not None and legacy_col not in available_columns:
+            continue
+        key = (legacy_col, meta['kind'])
+        if key in seen:
+            continue
+        seen.add(key)
+        evidence_fields.append({
+            'id': f"E{stable_hash(f'legacy::{legacy_key}::{legacy_col}', 10)}",
+            'column': legacy_col,
+            'kind': meta['kind'],
+            'resolved_kind': meta['kind'],
+            'weight': meta['weight'],
+            'enabled': True,
+        })
+    return {
+        'entity_column': entity_column,
+        'evidence_fields': evidence_fields,
+    }
+
+def suggest_evidence_fields(df: pd.DataFrame, entity_column: str, max_fields: int=6) -> list[dict]:
+    candidates = []
+    for idx, column in enumerate(df.columns.tolist()):
+        if column == entity_column:
+            continue
+        series = df[column]
+        nonempty = series.dropna()
+        if nonempty.empty:
+            continue
+        kind = infer_evidence_kind_from_series(series, column)
+        name = str(column).lower()
+        coverage = float(nonempty.shape[0]) / max(1, len(series))
+        score = coverage
+        if kind == 'year/date':
+            score += 0.35
+        elif kind == 'categorical':
+            cardinality = float(nonempty.astype(str).str.strip().nunique()) / max(1, len(nonempty))
+            if cardinality <= 0.3:
+                score += 0.25
+        elif kind == 'numeric':
+            score += 0.20
+        elif kind == 'text':
+            score += 0.05
+        if re.search(r'(note|remark|comment)', name):
+            score -= 0.1
+        candidates.append((score, idx, column, kind))
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    defaults = {'year/date': 0.10, 'categorical': 0.08, 'numeric': 0.05, 'text': 0.03}
+    out = []
+    for rank, (_, _, column, kind) in enumerate(candidates[:max_fields], start=1):
+        out.append({
+            'id': f"E{stable_hash(f'suggest::{column}::{kind}::{rank}', 10)}",
+            'column': column,
+            'kind': kind,
+            'resolved_kind': kind,
+            'weight': defaults.get(kind, 0.08),
+            'enabled': True,
+        })
+    return out
 
 def make_pair_key(name_a: str, name_b: str, entity_column: str='Name of Vessel') -> str:
     normalized_names = sorted([clean_name(name_a), clean_name(name_b)])
@@ -74,6 +219,14 @@ def clean_unit(value: str) -> str:
     mapping = {'ton': 'tons', 'tons': 'tons', 'tns': 'tons', 'toise': 'toise', 'barrels': 'barrels', 'barrel': 'barrels', 'baskets': 'baskets', 'crates': 'crates', 'boxes': 'boxes'}
     return mapping.get(s, s)
 
+def clean_categorical_value(value: str, column_name: str='') -> str:
+    name = str(column_name or '').lower()
+    if 'unit' in name:
+        return clean_unit(value)
+    if 'type' in name or 'category' in name:
+        return clean_vessel_type(value)
+    return clean_name(value)
+
 def to_float(value):
     if pd.isna(value):
         return None
@@ -85,6 +238,26 @@ def to_float(value):
         return float(match.group())
     except Exception:
         return None
+
+def parse_year_value(value):
+    if pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return int(value.year)
+    if isinstance(value, datetime):
+        return int(value.year)
+    s = str(value).strip()
+    if not s:
+        return None
+    match = re.search(r'\b(1[5-9]\d{2}|20\d{2})\b', s)
+    if match:
+        return int(match.group(1))
+    numeric = pd.to_numeric(pd.Series([s]), errors='coerce').iloc[0]
+    if pd.notna(numeric):
+        numeric_int = int(numeric)
+        if 1500 <= numeric_int <= 2100:
+            return numeric_int
+    return None
 
 def most_common_nonempty(values, default=''):
     vals = [v for v in values if v]
@@ -136,7 +309,7 @@ def tons_similarity(a_value, b_value):
         return 0.2
     return 0.0
 
-def build_reason_list(name_score, same_clean, year_score, unit_score, type_score, cargo_amount_score):
+def build_reason_list(name_score, same_clean, evidence_details=None):
     reasons = []
     if same_clean:
         reasons.append('same cleaned name')
@@ -144,14 +317,9 @@ def build_reason_list(name_score, same_clean, year_score, unit_score, type_score
         reasons.append('very high raw-name similarity')
     elif name_score >= 0.88:
         reasons.append('high raw-name similarity')
-    if unit_score == 1.0:
-        reasons.append('shared cargo unit')
-    if type_score == 1.0:
-        reasons.append('shared vessel type')
-    if cargo_amount_score >= 0.8:
-        reasons.append('similar typical cargo amount')
-    if year_score >= 0.8:
-        reasons.append('overlapping/near years')
+    for detail in evidence_details or []:
+        if detail.get('score', 0.0) >= 0.8:
+            reasons.append(detail.get('reason', f"{detail.get('column', 'evidence')}: strong match"))
     if not reasons:
         reasons.append('flagged by fuzzy candidate generation')
     return reasons
@@ -182,33 +350,116 @@ def choose_canonical_name(stats_df, name_list):
     return sorted(candidates, key=canonical_sort_key)[0]
 
 def preprocess_rows(df: pd.DataFrame, column_config: dict) -> pd.DataFrame:
+    normalized_config = normalize_column_config(column_config, available_columns=df.columns.tolist())
     out = df.copy()
-    entity_col = column_config['entity_column']
+    entity_col = normalized_config['entity_column']
     out['raw_name'] = out.get(entity_col, pd.Series('', index=out.index)).fillna('').astype(str).map(lambda x: x.strip())
     out = out[out['raw_name'] != ''].copy()
     out['clean_name'] = out['raw_name'].map(clean_name)
     out['strict_name_key'] = out['raw_name'].map(strict_name_key)
-    type_col = column_config.get('type_column')
-    unit_col = column_config.get('unit_column')
-    amount_col = column_config.get('amount_column')
-    year_col = column_config.get('year_column')
-    notes_col_1 = column_config.get('notes_column_1')
-    notes_col_2 = column_config.get('notes_column_2')
-    out['vessel_type_clean'] = out.get(type_col, pd.Series('', index=out.index)).map(clean_vessel_type) if type_col else ''
-    out['unit_primary_clean'] = out.get(unit_col, pd.Series('', index=out.index)).map(clean_unit) if unit_col else ''
-    out['amount_primary_num'] = out.get(amount_col, pd.Series(None, index=out.index)).map(to_float) if amount_col else None
-    out['year_num'] = pd.to_numeric(out.get(year_col, pd.Series(None, index=out.index)), errors='coerce') if year_col else None
-    out['notes_combined'] = (out.get(notes_col_1, pd.Series('', index=out.index)).fillna('').astype(str).str.strip() + ' || ' + out.get(notes_col_2, pd.Series('', index=out.index)).fillna('').astype(str).str.strip()).str.strip(' |')
+
+    runtime_fields = []
+    for idx, field in enumerate(normalized_config.get('evidence_fields', [])):
+        if not field.get('enabled', True):
+            continue
+        column = field['column']
+        if column not in out.columns:
+            continue
+        source_series = out[column]
+        resolved_kind = field.get('resolved_kind', field.get('kind', 'categorical'))
+        if field.get('kind') == 'auto':
+            resolved_kind = infer_evidence_kind_from_series(source_series, column)
+        base_key = f"ev_{stable_hash(field['id'], 10)}"
+        runtime_field = {
+            'id': field['id'],
+            'column': column,
+            'kind': field.get('kind', resolved_kind),
+            'resolved_kind': resolved_kind,
+            'weight': clamp_weight(field.get('weight'), default=0.08),
+            'enabled': True,
+            'base_key': base_key,
+        }
+        if resolved_kind == 'categorical':
+            out[f"{base_key}_cat"] = source_series.map(lambda v: clean_categorical_value(v, column))
+        elif resolved_kind == 'numeric':
+            out[f"{base_key}_num"] = source_series.map(to_float)
+        elif resolved_kind == 'year/date':
+            out[f"{base_key}_year"] = source_series.map(parse_year_value)
+        else:
+            out[f"{base_key}_txt"] = source_series.fillna('').astype(str).map(lambda v: normalize_spaces(v) if v.strip() else '')
+        runtime_fields.append(runtime_field)
+
+    # Legacy compatibility fields retained for summary cards and safe-auto evidence display.
+    year_field = next((f for f in runtime_fields if f['resolved_kind'] == 'year/date'), None)
+    type_field = next((f for f in runtime_fields if f['resolved_kind'] == 'categorical' and re.search(r'(type|category)', f['column'], re.I)), None)
+    unit_field = next((f for f in runtime_fields if f['resolved_kind'] == 'categorical' and re.search(r'unit', f['column'], re.I)), None)
+    amount_field = next((f for f in runtime_fields if f['resolved_kind'] == 'numeric' and re.search(r'(amount|ton|weight)', f['column'], re.I)), None)
+    text_fields = [f for f in runtime_fields if f['resolved_kind'] == 'text']
+
+    out['year_num'] = out[f"{year_field['base_key']}_year"] if year_field else pd.Series(None, index=out.index)
+    out['vessel_type_clean'] = out[f"{type_field['base_key']}_cat"] if type_field else pd.Series('', index=out.index)
+    out['unit_primary_clean'] = out[f"{unit_field['base_key']}_cat"] if unit_field else pd.Series('', index=out.index)
+    out['amount_primary_num'] = out[f"{amount_field['base_key']}_num"] if amount_field else pd.Series(None, index=out.index)
+    if text_fields:
+        text_cols = [out[f"{field['base_key']}_txt"] for field in text_fields[:2]]
+        combined = text_cols[0].fillna('').astype(str).str.strip()
+        if len(text_cols) > 1:
+            combined = (combined + ' || ' + text_cols[1].fillna('').astype(str).str.strip()).str.strip(' |')
+        out['notes_combined'] = combined
+    else:
+        out['notes_combined'] = pd.Series('', index=out.index)
+
+    out.attrs['column_config_normalized'] = normalized_config
+    out.attrs['evidence_fields_runtime'] = runtime_fields
     return out
 
 def build_name_stats(rows: pd.DataFrame) -> pd.DataFrame:
+    runtime_fields = rows.attrs.get('evidence_fields_runtime', [])
     records = []
     for raw_name, grp in rows.groupby('raw_name', sort=False):
         years = grp['year_num'].dropna()
         tons_values = grp.loc[grp['unit_primary_clean'] == 'tons', 'amount_primary_num'].dropna().tolist()
-        records.append({'raw_name': raw_name, 'display_name': raw_name, 'clean_name': most_common_nonempty(grp['clean_name'].tolist(), default=clean_name(raw_name)), 'strict_name_key': most_common_nonempty(grp['strict_name_key'].tolist(), default=strict_name_key(raw_name)), 'row_count': int(len(grp)), 'min_year': int(years.min()) if len(years) else None, 'max_year': int(years.max()) if len(years) else None, 'vessel_types': tuple(sorted((v for v in set(grp['vessel_type_clean']) if v))), 'units': tuple(sorted((v for v in set(grp['unit_primary_clean']) if v))), 'median_tons': float(pd.Series(tons_values).median()) if tons_values else None, 'sample_notes': ' | '.join([n for n in grp['notes_combined'].dropna().astype(str).tolist() if n][:3])})
+        evidence_agg = {}
+        for field in runtime_fields:
+            base_key = field['base_key']
+            kind = field['resolved_kind']
+            if kind == 'categorical':
+                values = tuple(sorted(v for v in set(grp[f"{base_key}_cat"].dropna().tolist()) if v))
+                evidence_agg[field['id']] = {
+                    'column': field['column'],
+                    'kind': kind,
+                    'weight': field['weight'],
+                    'values': values,
+                }
+            elif kind == 'numeric':
+                nums = grp[f"{base_key}_num"].dropna().tolist()
+                evidence_agg[field['id']] = {
+                    'column': field['column'],
+                    'kind': kind,
+                    'weight': field['weight'],
+                    'median': float(pd.Series(nums).median()) if nums else None,
+                }
+            elif kind == 'year/date':
+                vals = grp[f"{base_key}_year"].dropna().tolist()
+                evidence_agg[field['id']] = {
+                    'column': field['column'],
+                    'kind': kind,
+                    'weight': field['weight'],
+                    'min_year': int(min(vals)) if vals else None,
+                    'max_year': int(max(vals)) if vals else None,
+                }
+            else:
+                texts = [t for t in grp[f"{base_key}_txt"].dropna().astype(str).tolist() if t]
+                evidence_agg[field['id']] = {
+                    'column': field['column'],
+                    'kind': kind,
+                    'weight': field['weight'],
+                    'sample_text': ' | '.join(texts[:3]),
+                }
+        records.append({'raw_name': raw_name, 'display_name': raw_name, 'clean_name': most_common_nonempty(grp['clean_name'].tolist(), default=clean_name(raw_name)), 'strict_name_key': most_common_nonempty(grp['strict_name_key'].tolist(), default=strict_name_key(raw_name)), 'row_count': int(len(grp)), 'min_year': int(years.min()) if len(years) else None, 'max_year': int(years.max()) if len(years) else None, 'vessel_types': tuple(sorted((v for v in set(grp['vessel_type_clean']) if v))), 'units': tuple(sorted((v for v in set(grp['unit_primary_clean']) if v))), 'median_tons': float(pd.Series(tons_values).median()) if tons_values else None, 'sample_notes': ' | '.join([n for n in grp['notes_combined'].dropna().astype(str).tolist() if n][:3]), 'evidence_agg': evidence_agg})
     stats = pd.DataFrame(records)
     stats['prefix_block'] = stats['clean_name'].map(lambda s: s[:4] if s else '')
+    stats.attrs['evidence_fields_runtime'] = runtime_fields
     return stats
 
 def build_safe_auto_groups(stats: pd.DataFrame, entity_column: str) -> pd.DataFrame:
@@ -229,9 +480,25 @@ def build_safe_auto_groups(stats: pd.DataFrame, entity_column: str) -> pd.DataFr
         out = out.sort_values(['member_count', 'total_rows', 'canonical_name'], ascending=[False, False, True]).reset_index(drop=True)
     return out
 
-def generate_candidate_pairs(stats: pd.DataFrame, entity_column: str, resolved_names=None, fuzzy_threshold: int=88) -> pd.DataFrame:
+def generate_candidate_pairs(stats: pd.DataFrame, entity_column: str, resolved_names=None, fuzzy_threshold: int=88, column_config: dict | None=None) -> pd.DataFrame:
     if resolved_names is None:
         resolved_names = set()
+    normalized_config = normalize_column_config(column_config or {"entity_column": entity_column})
+    active_evidence_fields = [f for f in normalized_config.get('evidence_fields', []) if f.get('enabled', True) and f.get('weight', 0.0) > 0]
+    if column_config is None and not active_evidence_fields:
+        runtime_fields = stats.attrs.get('evidence_fields_runtime', [])
+        active_evidence_fields = [
+            {
+                'id': field['id'],
+                'column': field['column'],
+                'kind': field.get('kind', field.get('resolved_kind', 'categorical')),
+                'resolved_kind': field.get('resolved_kind', 'categorical'),
+                'weight': field.get('weight', 0.08),
+                'enabled': True,
+            }
+            for field in runtime_fields
+            if field.get('enabled', True) and field.get('weight', 0.0) > 0
+        ]
     candidate_stats = stats[~stats['raw_name'].isin(resolved_names)].copy()
     by_name = {row['raw_name']: row for _, row in candidate_stats.iterrows()}
     pairs = {}
@@ -273,13 +540,65 @@ def generate_candidate_pairs(stats: pd.DataFrame, entity_column: str, resolved_n
         raw_score = fuzz.WRatio(row_a['raw_name'], row_b['raw_name']) / 100.0
         clean_score = fuzz.WRatio(row_a['clean_name'], row_b['clean_name']) / 100.0
         same_clean = row_a['clean_name'] == row_b['clean_name']
+        name_signal = 0.75 * max(raw_score, clean_score) + 0.25 * (1.0 if same_clean else clean_score)
+        evidence_scores = []
+        for field in active_evidence_fields:
+            field_id = field['id']
+            field_kind = field.get('resolved_kind', field.get('kind', 'categorical'))
+            agg_a = row_a.get('evidence_agg', {}).get(field_id, {})
+            agg_b = row_b.get('evidence_agg', {}).get(field_id, {})
+            score = 0.5
+            reason = f"{field['column']}: neutral evidence"
+            if field_kind == 'categorical':
+                score = overlap_score(tuple(agg_a.get('values', ())), tuple(agg_b.get('values', ())), missing_default=0.5)
+                if score == 1.0:
+                    reason = f"{field['column']}: same category"
+                elif score == 0.0:
+                    reason = f"{field['column']}: conflicting categories"
+            elif field_kind == 'numeric':
+                score = tons_similarity(agg_a.get('median'), agg_b.get('median'))
+                if score >= 0.8:
+                    reason = f"{field['column']}: similar median numeric value"
+                elif score == 0.0:
+                    reason = f"{field['column']}: numeric mismatch"
+            elif field_kind == 'year/date':
+                score = year_overlap_score(agg_a.get('min_year'), agg_a.get('max_year'), agg_b.get('min_year'), agg_b.get('max_year'))
+                if score >= 0.8:
+                    reason = f"{field['column']}: overlapping/near years"
+                elif score == 0.0:
+                    reason = f"{field['column']}: distant years"
+            elif field_kind == 'text':
+                text_a = agg_a.get('sample_text', '')
+                text_b = agg_b.get('sample_text', '')
+                if text_a and text_b:
+                    score = fuzz.WRatio(text_a, text_b) / 100.0
+                else:
+                    score = 0.5
+                if score >= 0.8:
+                    reason = f"{field['column']}: similar text context"
+                elif score <= 0.2 and text_a and text_b:
+                    reason = f"{field['column']}: different text context"
+            evidence_scores.append({
+                'id': field_id,
+                'column': field['column'],
+                'kind': field_kind,
+                'weight': clamp_weight(field.get('weight'), default=0.08),
+                'score': round(float(score), 4),
+                'reason': reason,
+            })
+        if evidence_scores:
+            evidence_weight_total = sum(item['weight'] for item in evidence_scores) or 1.0
+            evidence_signal = sum(item['score'] * item['weight'] for item in evidence_scores) / evidence_weight_total
+            final_score = 0.65 * name_signal + 0.35 * evidence_signal
+        else:
+            evidence_signal = 0.5
+            final_score = name_signal
         year_score = year_overlap_score(row_a['min_year'], row_a['max_year'], row_b['min_year'], row_b['max_year'])
         unit_score = overlap_score(row_a['units'], row_b['units'])
         type_score = overlap_score(row_a['vessel_types'], row_b['vessel_types'])
         cargo_amount_score = tons_similarity(row_a['median_tons'], row_b['median_tons'])
-        final_score = 0.45 * max(raw_score, clean_score) + 0.2 * (1.0 if same_clean else clean_score) + 0.12 * unit_score + 0.1 * year_score + 0.08 * type_score + 0.05 * cargo_amount_score
         pair_key = make_pair_key(row_a['display_name'], row_b['display_name'], entity_column)
-        candidate_records.append({'pair_key': pair_key, 'candidate_id': pair_key, 'name_a': row_a['display_name'], 'name_b': row_b['display_name'], 'score': round(final_score, 4), 'raw_name_score': round(raw_score, 4), 'clean_name_score': round(clean_score, 4), 'year_score': round(year_score, 4), 'unit_score': round(unit_score, 4), 'type_score': round(type_score, 4), 'cargo_amount_score': round(cargo_amount_score, 4), 'reasons': ' | '.join(build_reason_list(max(raw_score, clean_score), same_clean, year_score, unit_score, type_score, cargo_amount_score)), 'suggested_canonical': choose_canonical_name(candidate_stats, [row_a['display_name'], row_b['display_name']])})
+        candidate_records.append({'pair_key': pair_key, 'candidate_id': pair_key, 'name_a': row_a['display_name'], 'name_b': row_b['display_name'], 'score': round(final_score, 4), 'raw_name_score': round(raw_score, 4), 'clean_name_score': round(clean_score, 4), 'name_signal_score': round(name_signal, 4), 'evidence_signal_score': round(evidence_signal, 4), 'year_score': round(year_score, 4), 'unit_score': round(unit_score, 4), 'type_score': round(type_score, 4), 'cargo_amount_score': round(cargo_amount_score, 4), 'evidence_scores': evidence_scores, 'reasons': ' | '.join(build_reason_list(max(raw_score, clean_score), same_clean, evidence_scores)), 'suggested_canonical': choose_canonical_name(candidate_stats, [row_a['display_name'], row_b['display_name']])})
     queue = pd.DataFrame(candidate_records)
     if not queue.empty:
         queue = queue.sort_values(['score'], ascending=[False]).reset_index(drop=True)
@@ -638,4 +957,23 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 def build_manual_decision_record(row: pd.Series, decision: str, entity_column: str):
-    return {'pair_key': row['pair_key'], 'entity_column': entity_column, 'name_a': row['name_a'], 'name_b': row['name_b'], 'decision': decision, 'score': float(row['score']), 'raw_name_score': float(row['raw_name_score']), 'clean_name_score': float(row['clean_name_score']), 'year_score': float(row['year_score']), 'unit_score': float(row['unit_score']), 'type_score': float(row['type_score']), 'cargo_amount_score': float(row['cargo_amount_score']), 'reasons': row['reasons'], 'suggested_canonical': row['suggested_canonical'], 'updated_at': now_iso()}
+    return {
+        'pair_key': row['pair_key'],
+        'entity_column': entity_column,
+        'name_a': row['name_a'],
+        'name_b': row['name_b'],
+        'decision': decision,
+        'score': float(row['score']),
+        'raw_name_score': float(row['raw_name_score']),
+        'clean_name_score': float(row['clean_name_score']),
+        'name_signal_score': float(row.get('name_signal_score', row['score'])),
+        'evidence_signal_score': float(row.get('evidence_signal_score', 0.5)),
+        'year_score': float(row.get('year_score', 0.5)),
+        'unit_score': float(row.get('unit_score', 0.5)),
+        'type_score': float(row.get('type_score', 0.5)),
+        'cargo_amount_score': float(row.get('cargo_amount_score', 0.5)),
+        'evidence_scores': row.get('evidence_scores', []),
+        'reasons': row['reasons'],
+        'suggested_canonical': row['suggested_canonical'],
+        'updated_at': now_iso(),
+    }

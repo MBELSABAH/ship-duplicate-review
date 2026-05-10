@@ -1,6 +1,7 @@
 import io
 import json
 import hashlib
+from copy import deepcopy
 
 import pandas as pd
 import streamlit as st
@@ -18,6 +19,8 @@ from dedupe_engine import (
     now_iso,
     preprocess_rows,
     resolved_names_from_auto,
+    normalize_column_config,
+    suggest_evidence_fields,
     set_to_text,
     SHIP_DEFAULTS,
 )
@@ -51,6 +54,8 @@ def init_state():
         "auto_index": 0,
         "pair_index": 0,
         "column_config": {},
+        "evidence_fields": [],
+        "evidence_fields_fingerprint": None,
         "queue_settings_fingerprint": None,
         "pending_loaded_session": None,
         "load_session_feedback": None,
@@ -69,6 +74,17 @@ def reset_decision_state():
     st.session_state["queue_settings_fingerprint"] = None
     if "pair_decisions" in st.session_state:
         st.session_state["pair_decisions"] = {}
+
+def mapping_fingerprint(sheet_name: str, available_cols: list[str], entity_column: str) -> str:
+    payload = {
+        "sheet": sheet_name,
+        "columns": [str(c) for c in available_cols],
+        "entity": entity_column,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+def config_fingerprint(column_config: dict) -> str:
+    return hashlib.sha256(json.dumps(column_config, sort_keys=True).encode("utf-8")).hexdigest()
 
 def ensure_auto_group_schema(df: pd.DataFrame) -> pd.DataFrame:
     if df is None:
@@ -262,6 +278,7 @@ def app():
     default_entity = SHIP_DEFAULTS["entity_column"] if SHIP_DEFAULTS["entity_column"] in available_cols else (text_candidates[0] if text_candidates else available_cols[0])
     if pending_loaded_session:
         saved_cfg = pending_loaded_session.get("column_config", {}) if isinstance(pending_loaded_session.get("column_config", {}), dict) else {}
+        saved_cfg = normalize_column_config(saved_cfg, available_columns=available_cols)
         saved_entity_column = saved_cfg.get("entity_column")
         if not saved_entity_column or saved_entity_column not in available_cols:
             st.session_state["load_session_feedback"] = (
@@ -296,27 +313,11 @@ def app():
                 )
                 pending_loaded_session = None
             else:
-                missing_optional_cols = [
-                    value
-                    for cfg_key, value in saved_cfg.items()
-                    if cfg_key != "entity_column" and value and value not in available_cols
-                ]
-                mapping_to_widget = {
-                    "entity_column": "entity_column_select",
-                    "year_column": "year_column_select",
-                    "type_column": "type_column_select",
-                    "amount_column": "amount_column_select",
-                    "unit_column": "unit_column_select",
-                    "notes_column_1": "notes_column_1_select",
-                    "notes_column_2": "notes_column_2_select",
-                }
-                for cfg_key, widget_key in mapping_to_widget.items():
-                    value = saved_cfg.get(cfg_key)
-                    fallback = default_entity if cfg_key == "entity_column" else "(None)"
-                    if value in available_cols:
-                        st.session_state[widget_key] = value
-                    else:
-                        st.session_state[widget_key] = fallback
+                missing_evidence_cols = [f["column"] for f in saved_cfg.get("evidence_fields", []) if f.get("column") not in available_cols]
+                saved_cfg["evidence_fields"] = [f for f in saved_cfg.get("evidence_fields", []) if f.get("column") in available_cols]
+                st.session_state["entity_column_select"] = saved_entity_column
+                st.session_state["evidence_fields"] = deepcopy(saved_cfg.get("evidence_fields", []))
+                st.session_state["evidence_fields_fingerprint"] = mapping_fingerprint(sheet_name, available_cols, saved_entity_column)
                 st.session_state["column_config"] = saved_cfg
                 st.session_state["auto_status"] = pending_loaded_session.get("auto_status", {})
                 st.session_state["manual_decisions"] = pending_loaded_session.get("manual_decisions", {})
@@ -326,10 +327,10 @@ def app():
                 feedback_messages = []
                 if older_session_warning:
                     feedback_messages.append("This looks like an older session file without workbook fingerprint metadata. Loaded with caution.")
-                if missing_optional_cols:
+                if missing_evidence_cols:
                     feedback_messages.append(
-                        "Loaded session. Some saved columns are missing in the current sheet: "
-                        + ", ".join(sorted(set(missing_optional_cols)))
+                        "Loaded session. Some saved evidence columns are missing in the current sheet: "
+                        + ", ".join(sorted(set(missing_evidence_cols)))
                         + ". Current mapping fallback was used where needed."
                     )
                 if feedback_messages:
@@ -337,47 +338,99 @@ def app():
                 else:
                     st.session_state["load_session_feedback"] = ("success", "Review session loaded.")
 
-    saved_config = st.session_state.get("column_config", {}) or {}
+    saved_config = normalize_column_config(st.session_state.get("column_config", {}) or {}, available_columns=available_cols)
     with st.sidebar:
         st.subheader("Column mapping")
         entity_default = saved_config.get("entity_column") if saved_config.get("entity_column") in available_cols else default_entity
-        if pending_loaded_session:
-            entity_column = st.selectbox("Primary column to deduplicate/review", available_cols, key="entity_column_select")
-        else:
-            entity_column = st.selectbox(
-                "Primary column to deduplicate/review",
-                available_cols,
-                index=available_cols.index(entity_default),
-                key="entity_column_select",
-            )
-        optional_options = ["(None)"] + available_cols
-        def optional_select(label, cfg_key, widget_key):
-            from_saved = saved_config.get(cfg_key)
-            if from_saved in available_cols:
-                default_val = from_saved
-            else:
-                default_val = SHIP_DEFAULTS[cfg_key] if SHIP_DEFAULTS[cfg_key] in available_cols else "(None)"
-            if pending_loaded_session:
-                return st.selectbox(label, optional_options, key=widget_key)
-            return st.selectbox(label, optional_options, index=optional_options.index(default_val), key=widget_key)
-        year_column = optional_select("Year/date column (optional)", "year_column", "year_column_select")
-        type_column = optional_select("Type/category column (optional)", "type_column", "type_column_select")
-        amount_column = optional_select("Amount column (optional)", "amount_column", "amount_column_select")
-        unit_column = optional_select("Unit column (optional)", "unit_column", "unit_column_select")
-        notes_column_1 = optional_select("Remarks/notes column 1 (optional)", "notes_column_1", "notes_column_1_select")
-        notes_column_2 = optional_select("Remarks/notes column 2 (optional)", "notes_column_2", "notes_column_2_select")
+        entity_column = st.selectbox(
+            "Primary column to deduplicate/review",
+            available_cols,
+            index=available_cols.index(entity_default),
+            key="entity_column_select",
+        )
 
-    def none_if_placeholder(v):
-        return None if v == "(None)" else v
-    column_config = {
-        "entity_column": entity_column,
-        "year_column": none_if_placeholder(year_column),
-        "type_column": none_if_placeholder(type_column),
-        "amount_column": none_if_placeholder(amount_column),
-        "unit_column": none_if_placeholder(unit_column),
-        "notes_column_1": none_if_placeholder(notes_column_1),
-        "notes_column_2": none_if_placeholder(notes_column_2),
-    }
+        current_mapping_fingerprint = mapping_fingerprint(sheet_name, available_cols, entity_column)
+        if st.session_state.get("evidence_fields_fingerprint") != current_mapping_fingerprint:
+            seeded = [f for f in saved_config.get("evidence_fields", []) if f.get("column") in available_cols and f.get("column") != entity_column]
+            if not seeded:
+                seeded = suggest_evidence_fields(raw_df_preview, entity_column=entity_column, max_fields=6)
+            st.session_state["evidence_fields"] = deepcopy(seeded)
+            st.session_state["evidence_fields_fingerprint"] = current_mapping_fingerprint
+
+        st.markdown("**Evidence fields**")
+        st.caption("Evidence fields adjust candidate scores. They do not automatically merge records.")
+        editable_fields = deepcopy(st.session_state.get("evidence_fields", []))
+        selectable_columns = [c for c in available_cols if c != entity_column]
+        remove_idx = None
+        for idx, field in enumerate(editable_fields):
+            row_key = str(field.get("id", f"row-{idx}"))
+            row_cols = st.columns([1.7, 1.1, 0.8, 0.5])
+            column_value = field.get("column")
+            if column_value not in selectable_columns and selectable_columns:
+                column_value = selectable_columns[0]
+            if selectable_columns:
+                selected_column = row_cols[0].selectbox(
+                    f"Column {idx + 1}",
+                    selectable_columns,
+                    index=selectable_columns.index(column_value) if column_value in selectable_columns else 0,
+                    key=f"evidence_column_{row_key}",
+                    label_visibility="collapsed",
+                )
+            else:
+                selected_column = ""
+            kind_options = ["auto", "categorical", "numeric", "year/date", "text"]
+            selected_kind = row_cols[1].selectbox(
+                f"Kind {idx + 1}",
+                kind_options,
+                index=kind_options.index(field.get("kind", "auto")) if field.get("kind", "auto") in kind_options else 0,
+                key=f"evidence_kind_{row_key}",
+                label_visibility="collapsed",
+            )
+            selected_weight = row_cols[2].slider(
+                f"Weight {idx + 1}",
+                0.0,
+                1.0,
+                float(field.get("weight", 0.08)),
+                0.01,
+                key=f"evidence_weight_{row_key}",
+                label_visibility="collapsed",
+            )
+            if row_cols[3].button("-", key=f"remove_evidence_{row_key}", use_container_width=True):
+                remove_idx = idx
+            field.update({
+                "column": selected_column,
+                "kind": selected_kind,
+                "weight": selected_weight,
+                "enabled": True,
+            })
+
+        if remove_idx is not None:
+            editable_fields.pop(remove_idx)
+            st.session_state["evidence_fields"] = editable_fields
+            st.rerun()
+
+        add_cols = st.columns(2)
+        if add_cols[0].button("+ Add evidence field", use_container_width=True):
+            if selectable_columns:
+                editable_fields.append({
+                    "id": f"E{hashlib.sha1(f'{sheet_name}::{entity_column}::{len(editable_fields)}'.encode('utf-8')).hexdigest()[:10]}",
+                    "column": selectable_columns[0],
+                    "kind": "auto",
+                    "weight": 0.08,
+                    "enabled": True,
+                })
+                st.session_state["evidence_fields"] = editable_fields
+                st.rerun()
+        if add_cols[1].button("Auto-suggest evidence fields", use_container_width=True):
+            st.session_state["evidence_fields"] = suggest_evidence_fields(raw_df_preview, entity_column=entity_column, max_fields=6)
+            st.rerun()
+
+    st.session_state["evidence_fields"] = editable_fields
+    column_config = normalize_column_config(
+        {"entity_column": entity_column, "evidence_fields": st.session_state.get("evidence_fields", [])},
+        available_columns=available_cols,
+    )
+    column_config["evidence_fields"] = [f for f in column_config["evidence_fields"] if f.get("column") != entity_column]
     st.session_state["column_config"] = column_config
 
     raw_df, rows_df, stats_df, auto_groups_df = build_base_data(file_bytes, sheet_name, column_config)
@@ -401,7 +454,7 @@ def app():
     active_manual_decisions = active_manual_decisions_for_config(st.session_state["manual_decisions"], column_config)
     queue_settings_fingerprint = (
         sheet_name,
-        tuple(sorted(column_config.items())),
+        config_fingerprint(column_config),
         fuzzy_threshold,
         min_manual_score,
         hide_reviewed_candidates,
@@ -415,6 +468,7 @@ def app():
         entity_column=column_config["entity_column"],
         resolved_names=resolved_names,
         fuzzy_threshold=fuzzy_threshold,
+        column_config=column_config,
     )
     score_filtered_queue_df = full_queue_df[full_queue_df["score"] >= min_manual_score].reset_index(drop=True) if not full_queue_df.empty else full_queue_df.copy()
     visible_queue_df = score_filtered_queue_df.copy()
@@ -612,16 +666,20 @@ def app():
             with cols[1]:
                 show_summary_card("Side B", {"raw_name": row["name_b"], **stat_lookup[row["name_b"]]})
 
-            scores = st.columns(6)
-            scores[0].metric("Raw name", f"{row['raw_name_score']:.3f}")
-            scores[1].metric("Clean name", f"{row['clean_name_score']:.3f}")
-            scores[2].metric("Years", f"{row['year_score']:.3f}")
-            scores[3].metric("Units", f"{row['unit_score']:.3f}")
-            scores[4].metric("Type/category evidence", f"{row['type_score']:.3f}")
-            scores[5].metric("Amount evidence", f"{row['cargo_amount_score']:.3f}")
-            st.caption("Cargo amount is weak supporting evidence, not registered vessel tonnage.")
+            score_cols = st.columns(4)
+            score_cols[0].metric("Raw name", f"{row['raw_name_score']:.3f}")
+            score_cols[1].metric("Clean name", f"{row['clean_name_score']:.3f}")
+            score_cols[2].metric("Name signal", f"{row.get('name_signal_score', 0.0):.3f}")
+            score_cols[3].metric("Evidence signal", f"{row.get('evidence_signal_score', 0.5):.3f}")
 
-            selected_cols = [column_config["entity_column"], column_config["year_column"], column_config["type_column"], column_config["amount_column"], column_config["unit_column"], column_config["notes_column_1"], column_config["notes_column_2"]]
+            evidence_scores = row.get("evidence_scores", [])
+            if isinstance(evidence_scores, list) and evidence_scores:
+                evidence_df = pd.DataFrame(evidence_scores)
+                evidence_df = evidence_df[["column", "kind", "score", "weight", "reason"]]
+                st.markdown("#### Evidence score breakdown")
+                st.dataframe(evidence_df, use_container_width=True, hide_index=True)
+
+            selected_cols = [column_config["entity_column"]] + [f.get("column") for f in column_config.get("evidence_fields", []) if f.get("column")]
             id_candidates = ["OID", "Volume", "Page", "Day", "Month", "Year", "Entry no."]
             display_columns = [c for c in selected_cols + id_candidates if c and c in raw_df.columns]
             display_columns = list(dict.fromkeys(display_columns))
