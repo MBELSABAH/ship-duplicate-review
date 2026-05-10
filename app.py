@@ -20,7 +20,6 @@ from dedupe_engine import (
     preprocess_rows,
     resolved_names_from_auto,
     normalize_column_config,
-    suggest_evidence_fields,
     set_to_text,
     SHIP_DEFAULTS,
 )
@@ -85,6 +84,37 @@ def mapping_fingerprint(sheet_name: str, available_cols: list[str], entity_colum
 
 def config_fingerprint(column_config: dict) -> str:
     return hashlib.sha256(json.dumps(column_config, sort_keys=True).encode("utf-8")).hexdigest()
+
+def default_factor_fields(available_cols: list[str], entity_column: str) -> list[dict]:
+    selectable_columns = [c for c in available_cols if c != entity_column]
+    preferred_order = [
+        "Type of Veseel",
+        "Year",
+        "Amount (primary)",
+        "Unit (primary)",
+    ]
+    noisy_tokens = {"day", "month", "volume", "oid", "page"}
+    picked = []
+    for col in preferred_order:
+        if col in selectable_columns:
+            picked.append(col)
+            break
+    if not picked:
+        for col in selectable_columns:
+            lowered = str(col).lower().replace("_", " ").replace("-", " ")
+            if not any(token in lowered.split() for token in noisy_tokens):
+                picked.append(col)
+                break
+    out = []
+    for idx, col in enumerate(picked):
+        out.append({
+            "id": f"E{hashlib.sha1(f'default::{entity_column}::{col}::{idx}'.encode('utf-8')).hexdigest()[:10]}",
+            "column": col,
+            "kind": "auto",
+            "weight": 0.08,
+            "enabled": True,
+        })
+    return out
 
 def ensure_auto_group_schema(df: pd.DataFrame) -> pd.DataFrame:
     if df is None:
@@ -343,7 +373,7 @@ def app():
         st.subheader("Column mapping")
         entity_default = saved_config.get("entity_column") if saved_config.get("entity_column") in available_cols else default_entity
         entity_column = st.selectbox(
-            "Primary column to deduplicate/review",
+            "Select column to deduplicate",
             available_cols,
             index=available_cols.index(entity_default),
             key="entity_column_select",
@@ -353,18 +383,17 @@ def app():
         if st.session_state.get("evidence_fields_fingerprint") != current_mapping_fingerprint:
             seeded = [f for f in saved_config.get("evidence_fields", []) if f.get("column") in available_cols and f.get("column") != entity_column]
             if not seeded:
-                seeded = suggest_evidence_fields(raw_df_preview, entity_column=entity_column, max_fields=6)
+                seeded = default_factor_fields(available_cols, entity_column)
             st.session_state["evidence_fields"] = deepcopy(seeded)
             st.session_state["evidence_fields_fingerprint"] = current_mapping_fingerprint
 
-        st.markdown("**Evidence fields**")
-        st.caption("Evidence fields adjust candidate scores. They do not automatically merge records.")
+        st.markdown("**Dedupe based on:**")
         editable_fields = deepcopy(st.session_state.get("evidence_fields", []))
         selectable_columns = [c for c in available_cols if c != entity_column]
         remove_idx = None
         for idx, field in enumerate(editable_fields):
             row_key = str(field.get("id", f"row-{idx}"))
-            row_cols = st.columns([1.7, 1.1, 0.8, 0.5])
+            row_cols = st.columns([2.0, 0.5])
             column_value = field.get("column")
             if column_value not in selectable_columns and selectable_columns:
                 column_value = selectable_columns[0]
@@ -378,29 +407,11 @@ def app():
                 )
             else:
                 selected_column = ""
-            kind_options = ["auto", "categorical", "numeric", "year/date", "text"]
-            selected_kind = row_cols[1].selectbox(
-                f"Kind {idx + 1}",
-                kind_options,
-                index=kind_options.index(field.get("kind", "auto")) if field.get("kind", "auto") in kind_options else 0,
-                key=f"evidence_kind_{row_key}",
-                label_visibility="collapsed",
-            )
-            selected_weight = row_cols[2].slider(
-                f"Weight {idx + 1}",
-                0.0,
-                1.0,
-                float(field.get("weight", 0.08)),
-                0.01,
-                key=f"evidence_weight_{row_key}",
-                label_visibility="collapsed",
-            )
-            if row_cols[3].button("-", key=f"remove_evidence_{row_key}", use_container_width=True):
+            if row_cols[1].button("-", key=f"remove_evidence_{row_key}", use_container_width=True):
                 remove_idx = idx
             field.update({
                 "column": selected_column,
-                "kind": selected_kind,
-                "weight": selected_weight,
+                "kind": "auto",
                 "enabled": True,
             })
 
@@ -409,20 +420,22 @@ def app():
             st.session_state["evidence_fields"] = editable_fields
             st.rerun()
 
-        add_cols = st.columns(2)
-        if add_cols[0].button("+ Add evidence field", use_container_width=True):
+        if st.button(
+            "+ Add factor",
+            use_container_width=True,
+            help="Add another column to consider when scoring possible matches.",
+        ):
             if selectable_columns:
+                existing_columns = {f.get("column") for f in editable_fields}
+                next_column = next((c for c in selectable_columns if c not in existing_columns), selectable_columns[0])
                 editable_fields.append({
                     "id": f"E{hashlib.sha1(f'{sheet_name}::{entity_column}::{len(editable_fields)}'.encode('utf-8')).hexdigest()[:10]}",
-                    "column": selectable_columns[0],
+                    "column": next_column,
                     "kind": "auto",
                     "weight": 0.08,
                     "enabled": True,
                 })
                 st.session_state["evidence_fields"] = editable_fields
-                st.rerun()
-        if add_cols[1].button("Auto-suggest evidence fields", use_container_width=True):
-            st.session_state["evidence_fields"] = suggest_evidence_fields(raw_df_preview, entity_column=entity_column, max_fields=6)
             st.rerun()
 
     st.session_state["evidence_fields"] = editable_fields
