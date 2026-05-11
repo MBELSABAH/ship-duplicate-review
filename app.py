@@ -2,6 +2,7 @@ import io
 import json
 import hashlib
 from copy import deepcopy
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
@@ -85,6 +86,36 @@ def mapping_fingerprint(sheet_name: str, available_cols: list[str], entity_colum
 def config_fingerprint(column_config: dict) -> str:
     return hashlib.sha256(json.dumps(column_config, sort_keys=True).encode("utf-8")).hexdigest()
 
+def new_factor_id() -> str:
+    return f"E{uuid4().hex[:12]}"
+
+def normalize_factor_rows_for_ui(evidence_fields: list[dict], available_cols: list[str], entity_column: str) -> list[dict]:
+    out = []
+    seen_ids = set()
+    seen_columns = set()
+    for raw_field in evidence_fields or []:
+        if not isinstance(raw_field, dict):
+            continue
+        column = str(raw_field.get("column") or "").strip()
+        if not column or column == entity_column or column not in available_cols:
+            continue
+        normalized_column_key = column.lower()
+        if normalized_column_key in seen_columns:
+            continue
+        factor_id = str(raw_field.get("id") or "").strip()
+        if not factor_id or factor_id in seen_ids:
+            factor_id = new_factor_id()
+        seen_ids.add(factor_id)
+        seen_columns.add(normalized_column_key)
+        out.append({
+            "id": factor_id,
+            "column": column,
+            "kind": "auto",
+            "weight": float(raw_field.get("weight", 0.08)),
+            "enabled": True,
+        })
+    return out
+
 def default_factor_fields(available_cols: list[str], entity_column: str) -> list[dict]:
     selectable_columns = [c for c in available_cols if c != entity_column]
     preferred_order = [
@@ -106,9 +137,9 @@ def default_factor_fields(available_cols: list[str], entity_column: str) -> list
                 picked.append(col)
                 break
     out = []
-    for idx, col in enumerate(picked):
+    for col in picked:
         out.append({
-            "id": f"E{hashlib.sha1(f'default::{entity_column}::{col}::{idx}'.encode('utf-8')).hexdigest()[:10]}",
+            "id": new_factor_id(),
             "column": col,
             "kind": "auto",
             "weight": 0.08,
@@ -346,7 +377,11 @@ def app():
                 missing_evidence_cols = [f["column"] for f in saved_cfg.get("evidence_fields", []) if f.get("column") not in available_cols]
                 saved_cfg["evidence_fields"] = [f for f in saved_cfg.get("evidence_fields", []) if f.get("column") in available_cols]
                 st.session_state["entity_column_select"] = saved_entity_column
-                st.session_state["evidence_fields"] = deepcopy(saved_cfg.get("evidence_fields", []))
+                st.session_state["evidence_fields"] = normalize_factor_rows_for_ui(
+                    deepcopy(saved_cfg.get("evidence_fields", [])),
+                    available_cols=available_cols,
+                    entity_column=saved_entity_column,
+                )
                 st.session_state["evidence_fields_fingerprint"] = mapping_fingerprint(sheet_name, available_cols, saved_entity_column)
                 st.session_state["column_config"] = saved_cfg
                 st.session_state["auto_status"] = pending_loaded_session.get("auto_status", {})
@@ -384,11 +419,19 @@ def app():
             seeded = [f for f in saved_config.get("evidence_fields", []) if f.get("column") in available_cols and f.get("column") != entity_column]
             if not seeded:
                 seeded = default_factor_fields(available_cols, entity_column)
-            st.session_state["evidence_fields"] = deepcopy(seeded)
+            st.session_state["evidence_fields"] = normalize_factor_rows_for_ui(
+                deepcopy(seeded),
+                available_cols=available_cols,
+                entity_column=entity_column,
+            )
             st.session_state["evidence_fields_fingerprint"] = current_mapping_fingerprint
 
         st.markdown("**Dedupe based on:**")
-        editable_fields = deepcopy(st.session_state.get("evidence_fields", []))
+        editable_fields = normalize_factor_rows_for_ui(
+            deepcopy(st.session_state.get("evidence_fields", [])),
+            available_cols=available_cols,
+            entity_column=entity_column,
+        )
         selectable_columns = [c for c in available_cols if c != entity_column]
         remove_idx = None
         for idx, field in enumerate(editable_fields):
@@ -429,16 +472,24 @@ def app():
                 existing_columns = {f.get("column") for f in editable_fields}
                 next_column = next((c for c in selectable_columns if c not in existing_columns), selectable_columns[0])
                 editable_fields.append({
-                    "id": f"E{hashlib.sha1(f'{sheet_name}::{entity_column}::{len(editable_fields)}'.encode('utf-8')).hexdigest()[:10]}",
+                    "id": new_factor_id(),
                     "column": next_column,
                     "kind": "auto",
                     "weight": 0.08,
                     "enabled": True,
                 })
-                st.session_state["evidence_fields"] = editable_fields
+                st.session_state["evidence_fields"] = normalize_factor_rows_for_ui(
+                    editable_fields,
+                    available_cols=available_cols,
+                    entity_column=entity_column,
+                )
             st.rerun()
 
-    st.session_state["evidence_fields"] = editable_fields
+    st.session_state["evidence_fields"] = normalize_factor_rows_for_ui(
+        editable_fields,
+        available_cols=available_cols,
+        entity_column=entity_column,
+    )
     column_config = normalize_column_config(
         {"entity_column": entity_column, "evidence_fields": st.session_state.get("evidence_fields", [])},
         available_columns=available_cols,

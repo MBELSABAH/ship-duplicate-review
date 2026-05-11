@@ -102,6 +102,22 @@ def sanitize_evidence_field(field: dict, idx: int=0, infer_kind: str='categorica
         'enabled': bool(field.get('enabled', True)),
     }
 
+def ensure_unique_evidence_ids(fields: list[dict], entity_column: str) -> list[dict]:
+    seen_ids = set()
+    out = []
+    for idx, field in enumerate(fields):
+        clean_field = dict(field)
+        candidate_id = str(clean_field.get('id') or '').strip()
+        if not candidate_id or candidate_id in seen_ids:
+            unique_seed = f"unique::{entity_column}::{clean_field.get('column', '')}::{idx}::{len(seen_ids)}"
+            candidate_id = f"E{stable_hash(unique_seed, 12)}"
+            while candidate_id in seen_ids:
+                candidate_id = f"E{stable_hash(candidate_id + 'x', 12)}"
+        clean_field['id'] = candidate_id
+        seen_ids.add(candidate_id)
+        out.append(clean_field)
+    return out
+
 def normalize_column_config(column_config: dict | None, available_columns: list[str] | None=None) -> dict:
     cfg = dict(column_config or {})
     entity_column = cfg.get('entity_column') or SHIP_DEFAULTS['entity_column']
@@ -141,6 +157,7 @@ def normalize_column_config(column_config: dict | None, available_columns: list[
             'weight': meta['weight'],
             'enabled': True,
         })
+    evidence_fields = ensure_unique_evidence_ids(evidence_fields, entity_column=entity_column)
     return {
         'entity_column': entity_column,
         'evidence_fields': evidence_fields,
@@ -503,44 +520,10 @@ def generate_candidate_pairs(stats: pd.DataFrame, entity_column: str, resolved_n
     by_name = {row['raw_name']: row for _, row in candidate_stats.iterrows()}
     pairs = {}
     candidate_records = []
+    threshold_score = fuzzy_threshold / 100.0
+    lower_name_floor = max(0.0, (fuzzy_threshold - 4) / 100.0)
 
-    def add_pair(name_a, name_b, source):
-        if name_a == name_b:
-            return
-        if name_a not in by_name or name_b not in by_name:
-            return
-        key = tuple(sorted((name_a, name_b)))
-        if key in pairs:
-            pairs[key].add(source)
-            return
-        pairs[key] = {source}
-    for _, grp in candidate_stats.groupby('clean_name'):
-        names = grp['raw_name'].tolist()
-        if len(names) < 2:
-            continue
-        for a, b in itertools.combinations(names, 2):
-            add_pair(a, b, 'same_clean_name')
-    for _, grp in candidate_stats.groupby('prefix_block'):
-        names = grp['raw_name'].tolist()
-        if len(names) < 2:
-            continue
-        if len(names) > 60:
-            grp = grp.sort_values(['row_count', 'raw_name'], ascending=[False, True]).head(60)
-            names = grp['raw_name'].tolist()
-        for a, b in itertools.combinations(names, 2):
-            row_a = by_name[a]
-            row_b = by_name[b]
-            raw_score = fuzz.WRatio(row_a['raw_name'], row_b['raw_name']) / 100.0
-            clean_score = fuzz.WRatio(row_a['clean_name'], row_b['clean_name']) / 100.0
-            if max(raw_score, clean_score) >= fuzzy_threshold / 100.0:
-                add_pair(a, b, 'fuzzy_prefix_block')
-    for (a, b), sources in pairs.items():
-        row_a = by_name[a]
-        row_b = by_name[b]
-        raw_score = fuzz.WRatio(row_a['raw_name'], row_b['raw_name']) / 100.0
-        clean_score = fuzz.WRatio(row_a['clean_name'], row_b['clean_name']) / 100.0
-        same_clean = row_a['clean_name'] == row_b['clean_name']
-        name_signal = 0.75 * max(raw_score, clean_score) + 0.25 * (1.0 if same_clean else clean_score)
+    def evaluate_evidence_scores(row_a, row_b):
         evidence_scores = []
         for field in active_evidence_fields:
             field_id = field['id']
@@ -589,6 +572,115 @@ def generate_candidate_pairs(stats: pd.DataFrame, entity_column: str, resolved_n
         if evidence_scores:
             evidence_weight_total = sum(item['weight'] for item in evidence_scores) or 1.0
             evidence_signal = sum(item['score'] * item['weight'] for item in evidence_scores) / evidence_weight_total
+        else:
+            evidence_signal = 0.5
+        return (evidence_scores, evidence_signal)
+
+    def add_pair(name_a, name_b, source):
+        if name_a == name_b:
+            return
+        if name_a not in by_name or name_b not in by_name:
+            return
+        key = tuple(sorted((name_a, name_b)))
+        if key in pairs:
+            pairs[key].add(source)
+            return
+        pairs[key] = {source}
+    for _, grp in candidate_stats.groupby('clean_name'):
+        names = grp['raw_name'].tolist()
+        if len(names) < 2:
+            continue
+        for a, b in itertools.combinations(names, 2):
+            add_pair(a, b, 'same_clean_name')
+    for _, grp in candidate_stats.groupby('prefix_block'):
+        names = grp['raw_name'].tolist()
+        if len(names) < 2:
+            continue
+        if len(names) > 60:
+            grp = grp.sort_values(['row_count', 'raw_name'], ascending=[False, True]).head(60)
+            names = grp['raw_name'].tolist()
+        for a, b in itertools.combinations(names, 2):
+            row_a = by_name[a]
+            row_b = by_name[b]
+            raw_score = fuzz.WRatio(row_a['raw_name'], row_b['raw_name']) / 100.0
+            clean_score = fuzz.WRatio(row_a['clean_name'], row_b['clean_name']) / 100.0
+            if max(raw_score, clean_score) >= threshold_score:
+                add_pair(a, b, 'fuzzy_prefix_block')
+
+    # Evidence-assisted expansion for borderline name similarity.
+    if active_evidence_fields and len(candidate_stats) > 1:
+        blocking_fields = [
+            field for field in sorted(active_evidence_fields, key=lambda f: f.get('weight', 0.0), reverse=True)
+            if field.get('resolved_kind', field.get('kind')) in {'categorical', 'numeric', 'year/date'}
+        ][:3]
+        blocks = defaultdict(set)
+        max_block_size = 36
+        max_candidates_per_block = 28
+        for _, row in candidate_stats.iterrows():
+            name = row['raw_name']
+            evidence_agg = row.get('evidence_agg', {})
+            for field in blocking_fields:
+                field_id = field['id']
+                field_kind = field.get('resolved_kind', field.get('kind'))
+                agg = evidence_agg.get(field_id, {})
+                if field_kind == 'categorical':
+                    for value in tuple(agg.get('values', ())):
+                        if not value:
+                            continue
+                        blocks[(field_id, 'cat', value)].add(name)
+                elif field_kind == 'year/date':
+                    min_year = agg.get('min_year')
+                    max_year = agg.get('max_year')
+                    if min_year is None or max_year is None:
+                        continue
+                    center = int((min_year + max_year) / 2)
+                    bucket = center // 2
+                    blocks[(field_id, 'year', bucket)].add(name)
+                elif field_kind == 'numeric':
+                    median = agg.get('median')
+                    if median is None:
+                        continue
+                    bucket = int(round(float(median) / 10.0))
+                    blocks[(field_id, 'num', bucket)].add(name)
+        for _, names_set in blocks.items():
+            if len(names_set) < 2:
+                continue
+            if len(names_set) > max_block_size:
+                continue
+            names = sorted(
+                names_set,
+                key=lambda n: (
+                    -int(by_name[n].get('row_count', 0)),
+                    n.lower(),
+                ),
+            )[:max_candidates_per_block]
+            for a, b in itertools.combinations(names, 2):
+                if (a, b) in pairs or (b, a) in pairs:
+                    continue
+                row_a = by_name[a]
+                row_b = by_name[b]
+                raw_score = fuzz.WRatio(row_a['raw_name'], row_b['raw_name']) / 100.0
+                clean_score = fuzz.WRatio(row_a['clean_name'], row_b['clean_name']) / 100.0
+                name_gate = max(raw_score, clean_score)
+                if name_gate >= threshold_score:
+                    continue
+                if name_gate < lower_name_floor:
+                    continue
+                evidence_scores, evidence_signal = evaluate_evidence_scores(row_a, row_b)
+                strong_evidence_count = sum(1 for item in evidence_scores if item['score'] >= 0.8)
+                if evidence_signal >= 0.82 and strong_evidence_count >= 1:
+                    add_pair(a, b, 'evidence_assisted_borderline')
+    for (a, b), sources in pairs.items():
+        row_a = by_name[a]
+        row_b = by_name[b]
+        raw_score = fuzz.WRatio(row_a['raw_name'], row_b['raw_name']) / 100.0
+        clean_score = fuzz.WRatio(row_a['clean_name'], row_b['clean_name']) / 100.0
+        same_clean = row_a['clean_name'] == row_b['clean_name']
+        name_signal = 0.75 * max(raw_score, clean_score) + 0.25 * (1.0 if same_clean else clean_score)
+        evidence_scores, evidence_signal = evaluate_evidence_scores(row_a, row_b)
+        if evidence_scores:
+            evidence_weight_total = sum(item['weight'] for item in evidence_scores) or 1.0
+            evidence_signal = sum(item['score'] * item['weight'] for item in evidence_scores) / evidence_weight_total
             final_score = 0.65 * name_signal + 0.35 * evidence_signal
         else:
             evidence_signal = 0.5
@@ -598,7 +690,10 @@ def generate_candidate_pairs(stats: pd.DataFrame, entity_column: str, resolved_n
         type_score = overlap_score(row_a['vessel_types'], row_b['vessel_types'])
         cargo_amount_score = tons_similarity(row_a['median_tons'], row_b['median_tons'])
         pair_key = make_pair_key(row_a['display_name'], row_b['display_name'], entity_column)
-        candidate_records.append({'pair_key': pair_key, 'candidate_id': pair_key, 'name_a': row_a['display_name'], 'name_b': row_b['display_name'], 'score': round(final_score, 4), 'raw_name_score': round(raw_score, 4), 'clean_name_score': round(clean_score, 4), 'name_signal_score': round(name_signal, 4), 'evidence_signal_score': round(evidence_signal, 4), 'year_score': round(year_score, 4), 'unit_score': round(unit_score, 4), 'type_score': round(type_score, 4), 'cargo_amount_score': round(cargo_amount_score, 4), 'evidence_scores': evidence_scores, 'reasons': ' | '.join(build_reason_list(max(raw_score, clean_score), same_clean, evidence_scores)), 'suggested_canonical': choose_canonical_name(candidate_stats, [row_a['display_name'], row_b['display_name']])})
+        reasons_list = build_reason_list(max(raw_score, clean_score), same_clean, evidence_scores)
+        if 'evidence_assisted_borderline' in sources and max(raw_score, clean_score) < threshold_score:
+            reasons_list.append('supporting evidence boosted borderline name match')
+        candidate_records.append({'pair_key': pair_key, 'candidate_id': pair_key, 'name_a': row_a['display_name'], 'name_b': row_b['display_name'], 'score': round(final_score, 4), 'raw_name_score': round(raw_score, 4), 'clean_name_score': round(clean_score, 4), 'name_signal_score': round(name_signal, 4), 'evidence_signal_score': round(evidence_signal, 4), 'year_score': round(year_score, 4), 'unit_score': round(unit_score, 4), 'type_score': round(type_score, 4), 'cargo_amount_score': round(cargo_amount_score, 4), 'evidence_scores': evidence_scores, 'reasons': ' | '.join(dict.fromkeys(reasons_list)), 'suggested_canonical': choose_canonical_name(candidate_stats, [row_a['display_name'], row_b['display_name']])})
     queue = pd.DataFrame(candidate_records)
     if not queue.empty:
         queue = queue.sort_values(['score'], ascending=[False]).reset_index(drop=True)
