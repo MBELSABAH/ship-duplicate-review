@@ -61,9 +61,12 @@ def clamp_weight(weight, default: float=0.08) -> float:
 def infer_evidence_kind_from_series(series: pd.Series, column_name: str='') -> str:
     name = str(column_name or '').strip().lower()
     name_has_year_hint = bool(re.search(r'(year|date|day|month)', name))
+    name_has_categorical_hint = bool(re.search(r'(type|category|unit|class|kind)', name))
     name_has_text_hint = bool(re.search(r'(note|remark|comment|description)', name))
     if name_has_year_hint:
         return 'year/date'
+    if name_has_categorical_hint:
+        return 'categorical'
     if pd.api.types.is_numeric_dtype(series):
         return 'numeric'
     nonempty = series.dropna().astype(str).str.strip()
@@ -500,10 +503,16 @@ def build_safe_auto_groups(stats: pd.DataFrame, entity_column: str) -> pd.DataFr
 def generate_candidate_pairs(stats: pd.DataFrame, entity_column: str, resolved_names=None, fuzzy_threshold: int=88, column_config: dict | None=None) -> pd.DataFrame:
     if resolved_names is None:
         resolved_names = set()
+    runtime_fields = stats.attrs.get('evidence_fields_runtime', [])
+    runtime_by_id = {field.get('id'): field for field in runtime_fields if field.get('id')}
+    runtime_by_column = {}
+    for field in runtime_fields:
+        col = field.get('column')
+        if col and col not in runtime_by_column:
+            runtime_by_column[col] = field
     normalized_config = normalize_column_config(column_config or {"entity_column": entity_column})
     active_evidence_fields = [f for f in normalized_config.get('evidence_fields', []) if f.get('enabled', True) and f.get('weight', 0.0) > 0]
     if column_config is None and not active_evidence_fields:
-        runtime_fields = stats.attrs.get('evidence_fields_runtime', [])
         active_evidence_fields = [
             {
                 'id': field['id'],
@@ -516,12 +525,23 @@ def generate_candidate_pairs(stats: pd.DataFrame, entity_column: str, resolved_n
             for field in runtime_fields
             if field.get('enabled', True) and field.get('weight', 0.0) > 0
         ]
+    resolved_active_fields = []
+    for field in active_evidence_fields:
+        clean_field = dict(field)
+        runtime_field = runtime_by_id.get(clean_field.get('id')) or runtime_by_column.get(clean_field.get('column'))
+        if runtime_field:
+            clean_field['resolved_kind'] = runtime_field.get('resolved_kind', clean_field.get('resolved_kind', clean_field.get('kind', 'categorical')))
+        elif clean_field.get('kind') == 'auto':
+            clean_field['resolved_kind'] = 'categorical'
+        clean_field['weight'] = clamp_weight(clean_field.get('weight'), default=0.08)
+        resolved_active_fields.append(clean_field)
+    active_evidence_fields = resolved_active_fields
     candidate_stats = stats[~stats['raw_name'].isin(resolved_names)].copy()
     by_name = {row['raw_name']: row for _, row in candidate_stats.iterrows()}
     pairs = {}
     candidate_records = []
     threshold_score = fuzzy_threshold / 100.0
-    lower_name_floor = max(0.0, (fuzzy_threshold - 4) / 100.0)
+    lower_name_floor = max(0.78, threshold_score - 0.08)
 
     def evaluate_evidence_scores(row_a, row_b):
         evidence_scores = []
@@ -668,7 +688,7 @@ def generate_candidate_pairs(stats: pd.DataFrame, entity_column: str, resolved_n
                     continue
                 evidence_scores, evidence_signal = evaluate_evidence_scores(row_a, row_b)
                 strong_evidence_count = sum(1 for item in evidence_scores if item['score'] >= 0.8)
-                if evidence_signal >= 0.82 and strong_evidence_count >= 1:
+                if evidence_signal >= 0.80 and strong_evidence_count >= 2:
                     add_pair(a, b, 'evidence_assisted_borderline')
     for (a, b), sources in pairs.items():
         row_a = by_name[a]
