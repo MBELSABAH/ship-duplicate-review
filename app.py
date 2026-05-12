@@ -233,6 +233,9 @@ def validate_session_payload(data: object) -> tuple[bool, str, dict]:
         decision = record.get("decision")
         if decision not in VALID_MANUAL_DECISIONS:
             return False, f"Invalid session format. manual_decisions entry `{pair_key}` has invalid decision `{decision}`.", {}
+        reviewer_comment = record.get("reviewer_comment", "")
+        if reviewer_comment is not None and not isinstance(reviewer_comment, str):
+            return False, f"Invalid session format. manual_decisions entry `{pair_key}` has invalid reviewer_comment type.", {}
     return True, "", data
 
 def build_session_payload(
@@ -386,7 +389,11 @@ def app():
                 st.session_state["evidence_fields_fingerprint"] = mapping_fingerprint(sheet_name, available_cols, saved_entity_column)
                 st.session_state["column_config"] = saved_cfg
                 st.session_state["auto_status"] = pending_loaded_session.get("auto_status", {})
-                st.session_state["manual_decisions"] = pending_loaded_session.get("manual_decisions", {})
+                loaded_manual_decisions = pending_loaded_session.get("manual_decisions", {})
+                for record in loaded_manual_decisions.values():
+                    if isinstance(record, dict):
+                        record.setdefault("reviewer_comment", "")
+                st.session_state["manual_decisions"] = loaded_manual_decisions
                 st.session_state["auto_index"] = 0
                 st.session_state["pair_index"] = 0
                 st.session_state["queue_settings_fingerprint"] = None
@@ -687,7 +694,12 @@ def app():
             idx = min(st.session_state["pair_index"], len(visible_queue_df) - 1)
             st.session_state["pair_index"] = idx
             row = visible_queue_df.iloc[idx]
-            decision = active_manual_decisions.get(row["pair_key"], {}).get("decision", "unreviewed")
+            existing_decision_record = active_manual_decisions.get(row["pair_key"], {})
+            decision = existing_decision_record.get("decision", "unreviewed")
+            saved_reviewer_comment = existing_decision_record.get("reviewer_comment", "") or ""
+            reviewer_comment_key = f"reviewer_comment_{row['pair_key']}"
+            if reviewer_comment_key not in st.session_state:
+                st.session_state[reviewer_comment_key] = saved_reviewer_comment
 
             with st.container(border=True):
                 info = st.columns([2, 1.3, 1.3, 2])
@@ -696,27 +708,55 @@ def app():
                 info[2].markdown(f"**Decision:** {decision}")
                 info[3].markdown(f"**Suggested canonical:** {row['suggested_canonical']}")
 
+            st.text_area(
+                "Reviewer comment / reasoning",
+                key=reviewer_comment_key,
+                help="Optional note explaining why this pair should be merged, kept separate, or marked unsure.",
+                placeholder=(
+                    "e.g., same vessel type and cargo pattern, but transcription is uncertain\n"
+                    "e.g., names are similar but years are too far apart\n"
+                    "e.g., reviewer recognizes this as a common spelling variant"
+                ),
+            )
+            current_reviewer_comment = st.session_state.get(reviewer_comment_key, "")
+
             nav = st.columns(6)
             if nav[0].button("Previous", width="stretch", key="manual_prev_button"):
                 st.session_state["pair_index"] = max(st.session_state["pair_index"] - 1, 0)
                 st.rerun()
             if nav[1].button("Merge", width="stretch", key="manual_merge_button"):
-                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "merge", column_config["entity_column"])
+                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(
+                    row,
+                    "merge",
+                    column_config["entity_column"],
+                    reviewer_comment=current_reviewer_comment,
+                )
                 if not hide_reviewed_candidates:
                     st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
             if nav[2].button("Keep separate", width="stretch", key="manual_keep_separate_button"):
-                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "keep_separate", column_config["entity_column"])
+                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(
+                    row,
+                    "keep_separate",
+                    column_config["entity_column"],
+                    reviewer_comment=current_reviewer_comment,
+                )
                 if not hide_reviewed_candidates:
                     st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
             if nav[3].button("Unsure", width="stretch", key="manual_unsure_button"):
-                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "unsure", column_config["entity_column"])
+                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(
+                    row,
+                    "unsure",
+                    column_config["entity_column"],
+                    reviewer_comment=current_reviewer_comment,
+                )
                 if not hide_reviewed_candidates:
                     st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
             if nav[4].button("Undo", width="stretch", key="manual_undo_button"):
                 st.session_state["manual_decisions"].pop(row["pair_key"], None)
+                st.session_state.pop(reviewer_comment_key, None)
                 st.rerun()
             if nav[5].button("Next", width="stretch", key="manual_next_button"):
                 st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
@@ -868,6 +908,8 @@ def app():
             auto_export["members"] = auto_export["members_list"].map(lambda x: " | ".join(x))
             auto_export["members_list"] = auto_export["members_list"].map(lambda x: " | ".join(x))
         pair_export = pd.DataFrame(st.session_state["manual_decisions"].values())
+        if "reviewer_comment" not in pair_export.columns:
+            pair_export["reviewer_comment"] = ""
         source_filename = getattr(uploaded, "name", "") or "uploaded_workbook.xlsx"
         session_payload = build_session_payload(
             source_filename=source_filename,
@@ -891,6 +933,11 @@ def app():
                     if not is_valid:
                         st.warning(validation_message)
                     else:
+                        for record in normalized_session.get("manual_decisions", {}).values():
+                            if isinstance(record, dict) and not isinstance(record.get("reviewer_comment", ""), str):
+                                record["reviewer_comment"] = ""
+                            elif isinstance(record, dict):
+                                record.setdefault("reviewer_comment", "")
                         st.session_state["pending_loaded_session"] = normalized_session
                         st.rerun()
 

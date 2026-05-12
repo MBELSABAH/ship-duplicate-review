@@ -747,12 +747,12 @@ def build_merge_outputs(stats_df, auto_groups_df, auto_status, manual_decisions)
                 members = row['members_list']
                 for m in members[1:]:
                     uf.union(members[0], m)
-                history_records.append({'merge_source': 'auto_group', 'merge_id': gid, 'canonical_name': row['canonical_name'], 'members': ' | '.join(members), 'reason': row['reasons'], 'status': 'active'})
+                history_records.append({'merge_source': 'auto_group', 'merge_id': gid, 'canonical_name': row['canonical_name'], 'members': ' | '.join(members), 'reason': row['reasons'], 'reviewer_comment': '', 'status': 'active'})
     if manual_decisions:
         for pair_key, row in manual_decisions.items():
             if row.get('decision') == 'merge':
                 uf.union(row['name_a'], row['name_b'])
-                history_records.append({'merge_source': 'manual_pair', 'merge_id': pair_key, 'canonical_name': row['suggested_canonical'], 'members': f"{row['name_a']} | {row['name_b']}", 'reason': row['reasons'], 'status': 'active'})
+                history_records.append({'merge_source': 'manual_pair', 'merge_id': pair_key, 'canonical_name': row['suggested_canonical'], 'members': f"{row['name_a']} | {row['name_b']}", 'reason': row['reasons'], 'reviewer_comment': row.get('reviewer_comment', ''), 'status': 'active'})
     all_names = set()
     for rec in history_records:
         parts = [p.strip() for p in rec['members'].split('|')]
@@ -802,6 +802,7 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
     source_map = {}
     score_map = {}
     reason_map = {}
+    reviewer_comment_map = {}
     if not auto_groups_df.empty:
         accepted = set(history_df.loc[history_df['merge_source'] == 'auto_group', 'merge_id'].tolist()) if not history_df.empty else set()
         for _, row in auto_groups_df.iterrows():
@@ -810,9 +811,11 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
                     status_map[member] = 'merged'
                     source_map[member] = 'auto_group'
                     reason_map[member] = row.get('reasons', '')
+                    reviewer_comment_map[member] = row.get('reviewer_comment', '')
     for rec in manual_decisions.values():
         names = [rec.get('name_a', ''), rec.get('name_b', '')]
         decision = rec.get('decision', '')
+        reviewer_comment = rec.get('reviewer_comment', '')
         for name in names:
             if name in merged_values or decision == 'merge':
                 status_map[name] = 'merged'
@@ -825,6 +828,7 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
                 source_map[name] = 'manual_unsure'
             score_map[name] = rec.get('score', '')
             reason_map[name] = rec.get('reasons', '')
+            reviewer_comment_map[name] = reviewer_comment
     unreviewed_names = set()
     if candidate_queue_df is not None and (not candidate_queue_df.empty):
         for _, row in candidate_queue_df.iterrows():
@@ -838,6 +842,7 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
     cleaned_df['dedupe_decision_source'] = normalized_original_values.map(lambda x: source_map.get(x, '')).fillna('')
     cleaned_df['dedupe_score'] = normalized_original_values.map(lambda x: score_map.get(x, '')).fillna('')
     cleaned_df['dedupe_reason'] = normalized_original_values.map(lambda x: reason_map.get(x, '')).fillna('')
+    cleaned_df['dedupe_reviewer_comment'] = normalized_original_values.map(lambda x: reviewer_comment_map.get(x, '')).fillna('')
 
     def default_status(v: str) -> str:
         if v in merged_values:
@@ -857,6 +862,7 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
         'dedupe_decision_source',
         'dedupe_score',
         'dedupe_reason',
+        'dedupe_reviewer_comment',
     ]
 
     if overwrite_entity_column:
@@ -1071,7 +1077,7 @@ def build_standardized_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataF
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
-def build_manual_decision_record(row: pd.Series, decision: str, entity_column: str):
+def build_manual_decision_record(row: pd.Series, decision: str, entity_column: str, reviewer_comment: str=''):
     return {
         'pair_key': row['pair_key'],
         'entity_column': entity_column,
@@ -1088,6 +1094,7 @@ def build_manual_decision_record(row: pd.Series, decision: str, entity_column: s
         'type_score': float(row.get('type_score', 0.5)),
         'cargo_amount_score': float(row.get('cargo_amount_score', 0.5)),
         'evidence_scores': row.get('evidence_scores', []),
+        'reviewer_comment': str(reviewer_comment or ''),
         'reasons': row['reasons'],
         'suggested_canonical': row['suggested_canonical'],
         'updated_at': now_iso(),
