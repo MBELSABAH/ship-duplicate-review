@@ -1,6 +1,8 @@
 import io
 import json
 import hashlib
+from copy import deepcopy
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
@@ -18,6 +20,7 @@ from dedupe_engine import (
     now_iso,
     preprocess_rows,
     resolved_names_from_auto,
+    normalize_column_config,
     set_to_text,
     SHIP_DEFAULTS,
 )
@@ -51,6 +54,8 @@ def init_state():
         "auto_index": 0,
         "pair_index": 0,
         "column_config": {},
+        "evidence_fields": [],
+        "evidence_fields_fingerprint": None,
         "queue_settings_fingerprint": None,
         "pending_loaded_session": None,
         "load_session_feedback": None,
@@ -70,6 +75,78 @@ def reset_decision_state():
     st.session_state["queue_settings_fingerprint"] = None
     if "pair_decisions" in st.session_state:
         st.session_state["pair_decisions"] = {}
+
+def mapping_fingerprint(sheet_name: str, available_cols: list[str], entity_column: str) -> str:
+    payload = {
+        "sheet": sheet_name,
+        "columns": [str(c) for c in available_cols],
+        "entity": entity_column,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+def config_fingerprint(column_config: dict) -> str:
+    return hashlib.sha256(json.dumps(column_config, sort_keys=True).encode("utf-8")).hexdigest()
+
+def new_factor_id() -> str:
+    return f"E{uuid4().hex[:12]}"
+
+def normalize_factor_rows_for_ui(evidence_fields: list[dict], available_cols: list[str], entity_column: str) -> list[dict]:
+    out = []
+    seen_ids = set()
+    seen_columns = set()
+    for raw_field in evidence_fields or []:
+        if not isinstance(raw_field, dict):
+            continue
+        column = str(raw_field.get("column") or "").strip()
+        if not column or column == entity_column or column not in available_cols:
+            continue
+        normalized_column_key = column.lower()
+        if normalized_column_key in seen_columns:
+            continue
+        factor_id = str(raw_field.get("id") or "").strip()
+        if not factor_id or factor_id in seen_ids:
+            factor_id = new_factor_id()
+        seen_ids.add(factor_id)
+        seen_columns.add(normalized_column_key)
+        out.append({
+            "id": factor_id,
+            "column": column,
+            "kind": "auto",
+            "weight": float(raw_field.get("weight", 0.08)),
+            "enabled": True,
+        })
+    return out
+
+def default_factor_fields(available_cols: list[str], entity_column: str) -> list[dict]:
+    selectable_columns = [c for c in available_cols if c != entity_column]
+    preferred_order = [
+        "Type of Veseel",
+        "Year",
+        "Amount (primary)",
+        "Unit (primary)",
+    ]
+    noisy_tokens = {"day", "month", "volume", "oid", "page"}
+    picked = []
+    for col in preferred_order:
+        if col in selectable_columns:
+            picked.append(col)
+            break
+    if not picked:
+        for col in selectable_columns:
+            lowered = str(col).lower().replace("_", " ").replace("-", " ")
+            if not any(token in lowered.split() for token in noisy_tokens):
+                picked.append(col)
+                break
+    out = []
+    for col in picked:
+        out.append({
+            "id": new_factor_id(),
+            "column": col,
+            "kind": "auto",
+            "weight": 0.08,
+            "enabled": True,
+        })
+    return out
 
 def ensure_auto_group_schema(df: pd.DataFrame) -> pd.DataFrame:
     if df is None:
@@ -231,7 +308,7 @@ def app():
         )
         sample_rows = st.slider("Evidence rows per side", 3, 12, 5, 1, key="evidence_rows_per_side_slider")
         st.subheader("Danger / reset")
-        if st.button("Reset all decisions", use_container_width=True, key="reset_all_decisions_button"):
+        if st.button("Reset all decisions", width="stretch", key="reset_all_decisions_button"):
             reset_decision_state()
             st.rerun()
 
@@ -263,6 +340,7 @@ def app():
     default_entity = SHIP_DEFAULTS["entity_column"] if SHIP_DEFAULTS["entity_column"] in available_cols else (text_candidates[0] if text_candidates else available_cols[0])
     if pending_loaded_session:
         saved_cfg = pending_loaded_session.get("column_config", {}) if isinstance(pending_loaded_session.get("column_config", {}), dict) else {}
+        saved_cfg = normalize_column_config(saved_cfg, available_columns=available_cols)
         saved_entity_column = saved_cfg.get("entity_column")
         if not saved_entity_column or saved_entity_column not in available_cols:
             st.session_state["load_session_feedback"] = (
@@ -297,27 +375,15 @@ def app():
                 )
                 pending_loaded_session = None
             else:
-                missing_optional_cols = [
-                    value
-                    for cfg_key, value in saved_cfg.items()
-                    if cfg_key != "entity_column" and value and value not in available_cols
-                ]
-                mapping_to_widget = {
-                    "entity_column": "entity_column_select",
-                    "year_column": "year_column_select",
-                    "type_column": "type_column_select",
-                    "amount_column": "amount_column_select",
-                    "unit_column": "unit_column_select",
-                    "notes_column_1": "notes_column_1_select",
-                    "notes_column_2": "notes_column_2_select",
-                }
-                for cfg_key, widget_key in mapping_to_widget.items():
-                    value = saved_cfg.get(cfg_key)
-                    fallback = default_entity if cfg_key == "entity_column" else "(None)"
-                    if value in available_cols:
-                        st.session_state[widget_key] = value
-                    else:
-                        st.session_state[widget_key] = fallback
+                missing_evidence_cols = [f["column"] for f in saved_cfg.get("evidence_fields", []) if f.get("column") not in available_cols]
+                saved_cfg["evidence_fields"] = [f for f in saved_cfg.get("evidence_fields", []) if f.get("column") in available_cols]
+                st.session_state["entity_column_select"] = saved_entity_column
+                st.session_state["evidence_fields"] = normalize_factor_rows_for_ui(
+                    deepcopy(saved_cfg.get("evidence_fields", [])),
+                    available_cols=available_cols,
+                    entity_column=saved_entity_column,
+                )
+                st.session_state["evidence_fields_fingerprint"] = mapping_fingerprint(sheet_name, available_cols, saved_entity_column)
                 st.session_state["column_config"] = saved_cfg
                 st.session_state["auto_status"] = pending_loaded_session.get("auto_status", {})
                 st.session_state["manual_decisions"] = pending_loaded_session.get("manual_decisions", {})
@@ -327,10 +393,10 @@ def app():
                 feedback_messages = []
                 if older_session_warning:
                     feedback_messages.append("This looks like an older session file without workbook fingerprint metadata. Loaded with caution.")
-                if missing_optional_cols:
+                if missing_evidence_cols:
                     feedback_messages.append(
-                        "Loaded session. Some saved columns are missing in the current sheet: "
-                        + ", ".join(sorted(set(missing_optional_cols)))
+                        "Loaded session. Some saved evidence columns are missing in the current sheet: "
+                        + ", ".join(sorted(set(missing_evidence_cols)))
                         + ". Current mapping fallback was used where needed."
                     )
                 if feedback_messages:
@@ -338,47 +404,98 @@ def app():
                 else:
                     st.session_state["load_session_feedback"] = ("success", "Review session loaded.")
 
-    saved_config = st.session_state.get("column_config", {}) or {}
+    saved_config = normalize_column_config(st.session_state.get("column_config", {}) or {}, available_columns=available_cols)
     with st.sidebar:
         st.subheader("Column mapping")
         entity_default = saved_config.get("entity_column") if saved_config.get("entity_column") in available_cols else default_entity
-        if pending_loaded_session:
-            entity_column = st.selectbox("Primary column to deduplicate/review", available_cols, key="entity_column_select")
-        else:
-            entity_column = st.selectbox(
-                "Primary column to deduplicate/review",
-                available_cols,
-                index=available_cols.index(entity_default),
-                key="entity_column_select",
-            )
-        optional_options = ["(None)"] + available_cols
-        def optional_select(label, cfg_key, widget_key):
-            from_saved = saved_config.get(cfg_key)
-            if from_saved in available_cols:
-                default_val = from_saved
-            else:
-                default_val = SHIP_DEFAULTS[cfg_key] if SHIP_DEFAULTS[cfg_key] in available_cols else "(None)"
-            if pending_loaded_session:
-                return st.selectbox(label, optional_options, key=widget_key)
-            return st.selectbox(label, optional_options, index=optional_options.index(default_val), key=widget_key)
-        year_column = optional_select("Year/date column (optional)", "year_column", "year_column_select")
-        type_column = optional_select("Type/category column (optional)", "type_column", "type_column_select")
-        amount_column = optional_select("Amount column (optional)", "amount_column", "amount_column_select")
-        unit_column = optional_select("Unit column (optional)", "unit_column", "unit_column_select")
-        notes_column_1 = optional_select("Remarks/notes column 1 (optional)", "notes_column_1", "notes_column_1_select")
-        notes_column_2 = optional_select("Remarks/notes column 2 (optional)", "notes_column_2", "notes_column_2_select")
+        entity_column = st.selectbox(
+            "Select column to deduplicate",
+            available_cols,
+            index=available_cols.index(entity_default),
+            key="entity_column_select",
+        )
 
-    def none_if_placeholder(v):
-        return None if v == "(None)" else v
-    column_config = {
-        "entity_column": entity_column,
-        "year_column": none_if_placeholder(year_column),
-        "type_column": none_if_placeholder(type_column),
-        "amount_column": none_if_placeholder(amount_column),
-        "unit_column": none_if_placeholder(unit_column),
-        "notes_column_1": none_if_placeholder(notes_column_1),
-        "notes_column_2": none_if_placeholder(notes_column_2),
-    }
+        current_mapping_fingerprint = mapping_fingerprint(sheet_name, available_cols, entity_column)
+        if st.session_state.get("evidence_fields_fingerprint") != current_mapping_fingerprint:
+            seeded = [f for f in saved_config.get("evidence_fields", []) if f.get("column") in available_cols and f.get("column") != entity_column]
+            if not seeded:
+                seeded = default_factor_fields(available_cols, entity_column)
+            st.session_state["evidence_fields"] = normalize_factor_rows_for_ui(
+                deepcopy(seeded),
+                available_cols=available_cols,
+                entity_column=entity_column,
+            )
+            st.session_state["evidence_fields_fingerprint"] = current_mapping_fingerprint
+
+        st.markdown("**Dedupe based on:**")
+        editable_fields = normalize_factor_rows_for_ui(
+            deepcopy(st.session_state.get("evidence_fields", [])),
+            available_cols=available_cols,
+            entity_column=entity_column,
+        )
+        selectable_columns = [c for c in available_cols if c != entity_column]
+        remove_idx = None
+        for idx, field in enumerate(editable_fields):
+            row_key = str(field.get("id", f"row-{idx}"))
+            row_cols = st.columns([2.0, 0.5])
+            column_value = field.get("column")
+            if column_value not in selectable_columns and selectable_columns:
+                column_value = selectable_columns[0]
+            if selectable_columns:
+                selected_column = row_cols[0].selectbox(
+                    f"Column {idx + 1}",
+                    selectable_columns,
+                    index=selectable_columns.index(column_value) if column_value in selectable_columns else 0,
+                    key=f"evidence_column_{row_key}",
+                    label_visibility="collapsed",
+                )
+            else:
+                selected_column = ""
+            if row_cols[1].button("-", key=f"remove_evidence_{row_key}", width="stretch"):
+                remove_idx = idx
+            field.update({
+                "column": selected_column,
+                "kind": "auto",
+                "enabled": True,
+            })
+
+        if remove_idx is not None:
+            editable_fields.pop(remove_idx)
+            st.session_state["evidence_fields"] = editable_fields
+            st.rerun()
+
+        if st.button(
+            "+ Add factor",
+            width="stretch",
+            help="Add another column to consider when scoring possible matches.",
+        ):
+            if selectable_columns:
+                existing_columns = {f.get("column") for f in editable_fields}
+                next_column = next((c for c in selectable_columns if c not in existing_columns), selectable_columns[0])
+                editable_fields.append({
+                    "id": new_factor_id(),
+                    "column": next_column,
+                    "kind": "auto",
+                    "weight": 0.08,
+                    "enabled": True,
+                })
+                st.session_state["evidence_fields"] = normalize_factor_rows_for_ui(
+                    editable_fields,
+                    available_cols=available_cols,
+                    entity_column=entity_column,
+                )
+            st.rerun()
+
+    st.session_state["evidence_fields"] = normalize_factor_rows_for_ui(
+        editable_fields,
+        available_cols=available_cols,
+        entity_column=entity_column,
+    )
+    column_config = normalize_column_config(
+        {"entity_column": entity_column, "evidence_fields": st.session_state.get("evidence_fields", [])},
+        available_columns=available_cols,
+    )
+    column_config["evidence_fields"] = [f for f in column_config["evidence_fields"] if f.get("column") != entity_column]
     st.session_state["column_config"] = column_config
 
     raw_df, rows_df, stats_df, auto_groups_df = build_base_data(file_bytes, sheet_name, column_config)
@@ -402,7 +519,7 @@ def app():
     active_manual_decisions = active_manual_decisions_for_config(st.session_state["manual_decisions"], column_config)
     queue_settings_fingerprint = (
         sheet_name,
-        tuple(sorted(column_config.items())),
+        config_fingerprint(column_config),
         fuzzy_threshold,
         min_manual_score,
         hide_reviewed_candidates,
@@ -416,6 +533,7 @@ def app():
         entity_column=column_config["entity_column"],
         resolved_names=resolved_names,
         fuzzy_threshold=fuzzy_threshold,
+        column_config=column_config,
     )
     score_filtered_queue_df = full_queue_df[full_queue_df["score"] >= min_manual_score].reset_index(drop=True) if not full_queue_df.empty else full_queue_df.copy()
     visible_queue_df = score_filtered_queue_df.copy()
@@ -473,7 +591,7 @@ def app():
             actions = st.columns(3)
             if actions[0].button(
                 "Accept all safe auto-merges",
-                use_container_width=True,
+                width="stretch",
                 key="auto_bulk_accept_button",
                 disabled=not has_auto_groups,
             ):
@@ -483,7 +601,7 @@ def app():
                 st.rerun()
             if actions[1].button(
                 "Reject all safe auto-merges",
-                use_container_width=True,
+                width="stretch",
                 key="auto_bulk_reject_button",
                 disabled=not has_auto_groups,
             ):
@@ -493,7 +611,7 @@ def app():
                 st.rerun()
             if actions[2].button(
                 "Clear all auto-merge decisions",
-                use_container_width=True,
+                width="stretch",
                 key="clear_all_auto_decisions_button",
                 disabled=auto_decision_count == 0,
             ):
@@ -520,23 +638,23 @@ def app():
                 info[2].markdown(f"**Canonical:** {row['canonical_name']}")
                 info[3].markdown(f"**Reason:** {row['reasons']}")
             nav = st.columns(5)
-            if nav[0].button("Previous", use_container_width=True, key="auto_prev_button"):
+            if nav[0].button("Previous", width="stretch", key="auto_prev_button"):
                 st.session_state["auto_index"] = max(st.session_state["auto_index"] - 1, 0)
                 st.rerun()
-            if nav[1].button("Accept", use_container_width=True, key="auto_accept_button"):
+            if nav[1].button("Accept", width="stretch", key="auto_accept_button"):
                 st.session_state["auto_status"][row["auto_group_key"]] = "accepted"
                 if not hide_reviewed_candidates:
                     st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
                 st.rerun()
-            if nav[2].button("Reject", use_container_width=True, key="auto_reject_button"):
+            if nav[2].button("Reject", width="stretch", key="auto_reject_button"):
                 st.session_state["auto_status"][row["auto_group_key"]] = "rejected"
                 if not hide_reviewed_candidates:
                     st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
                 st.rerun()
-            if nav[3].button("Undo", use_container_width=True, key="auto_undo_button"):
+            if nav[3].button("Undo", width="stretch", key="auto_undo_button"):
                 st.session_state["auto_status"].pop(row["auto_group_key"], None)
                 st.rerun()
-            if nav[4].button("Next", use_container_width=True, key="auto_next_button"):
+            if nav[4].button("Next", width="stretch", key="auto_next_button"):
                 st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
                 st.rerun()
 
@@ -552,7 +670,7 @@ def app():
             st.caption(f"Evidence rows per side slider is set to {sample_rows}.")
 
             preview = auto_preview_df[["auto_group_id", "auto_group_key", "canonical_name", "member_count", "total_rows", "reasons", "status"]].copy()
-            st.dataframe(preview, use_container_width=True, hide_index=True)
+            st.dataframe(preview, width="stretch", hide_index=True)
 
     with tabs[1]:
         st.subheader("Manual review queue")
@@ -579,28 +697,28 @@ def app():
                 info[3].markdown(f"**Suggested canonical:** {row['suggested_canonical']}")
 
             nav = st.columns(6)
-            if nav[0].button("Previous", use_container_width=True, key="manual_prev_button"):
+            if nav[0].button("Previous", width="stretch", key="manual_prev_button"):
                 st.session_state["pair_index"] = max(st.session_state["pair_index"] - 1, 0)
                 st.rerun()
-            if nav[1].button("Merge", use_container_width=True, key="manual_merge_button"):
+            if nav[1].button("Merge", width="stretch", key="manual_merge_button"):
                 st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "merge", column_config["entity_column"])
                 if not hide_reviewed_candidates:
                     st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
-            if nav[2].button("Keep separate", use_container_width=True, key="manual_keep_separate_button"):
+            if nav[2].button("Keep separate", width="stretch", key="manual_keep_separate_button"):
                 st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "keep_separate", column_config["entity_column"])
                 if not hide_reviewed_candidates:
                     st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
-            if nav[3].button("Unsure", use_container_width=True, key="manual_unsure_button"):
+            if nav[3].button("Unsure", width="stretch", key="manual_unsure_button"):
                 st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "unsure", column_config["entity_column"])
                 if not hide_reviewed_candidates:
                     st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
-            if nav[4].button("Undo", use_container_width=True, key="manual_undo_button"):
+            if nav[4].button("Undo", width="stretch", key="manual_undo_button"):
                 st.session_state["manual_decisions"].pop(row["pair_key"], None)
                 st.rerun()
-            if nav[5].button("Next", use_container_width=True, key="manual_next_button"):
+            if nav[5].button("Next", width="stretch", key="manual_next_button"):
                 st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
 
@@ -613,16 +731,20 @@ def app():
             with cols[1]:
                 show_summary_card("Side B", {"raw_name": row["name_b"], **stat_lookup[row["name_b"]]})
 
-            scores = st.columns(6)
-            scores[0].metric("Raw name", f"{row['raw_name_score']:.3f}")
-            scores[1].metric("Clean name", f"{row['clean_name_score']:.3f}")
-            scores[2].metric("Years", f"{row['year_score']:.3f}")
-            scores[3].metric("Units", f"{row['unit_score']:.3f}")
-            scores[4].metric("Type/category evidence", f"{row['type_score']:.3f}")
-            scores[5].metric("Amount evidence", f"{row['cargo_amount_score']:.3f}")
-            st.caption("Cargo amount is weak supporting evidence, not registered vessel tonnage.")
+            score_cols = st.columns(4)
+            score_cols[0].metric("Raw name", f"{row['raw_name_score']:.3f}")
+            score_cols[1].metric("Clean name", f"{row['clean_name_score']:.3f}")
+            score_cols[2].metric("Name signal", f"{row.get('name_signal_score', 0.0):.3f}")
+            score_cols[3].metric("Evidence signal", f"{row.get('evidence_signal_score', 0.5):.3f}")
 
-            selected_cols = [column_config["entity_column"], column_config["year_column"], column_config["type_column"], column_config["amount_column"], column_config["unit_column"], column_config["notes_column_1"], column_config["notes_column_2"]]
+            evidence_scores = row.get("evidence_scores", [])
+            if isinstance(evidence_scores, list) and evidence_scores:
+                evidence_df = pd.DataFrame(evidence_scores)
+                evidence_df = evidence_df[["column", "kind", "score", "weight", "reason"]]
+                st.markdown("#### Evidence score breakdown")
+                st.dataframe(evidence_df, width="stretch", hide_index=True)
+
+            selected_cols = [column_config["entity_column"]] + [f.get("column") for f in column_config.get("evidence_fields", []) if f.get("column")]
             id_candidates = ["OID", "Volume", "Page", "Day", "Month", "Year", "Entry no."]
             display_columns = [c for c in selected_cols + id_candidates if c and c in raw_df.columns]
             display_columns = list(dict.fromkeys(display_columns))
@@ -638,10 +760,10 @@ def app():
             previews = st.columns(2)
             with previews[0]:
                 with st.expander("Original rows for Side A", expanded=True):
-                    st.dataframe(left_rows, use_container_width=True, hide_index=True)
+                    st.dataframe(left_rows, width="stretch", hide_index=True)
             with previews[1]:
                 with st.expander("Original rows for Side B", expanded=True):
-                    st.dataframe(right_rows, use_container_width=True, hide_index=True)
+                    st.dataframe(right_rows, width="stretch", hide_index=True)
 
     with tabs[2]:
         st.subheader("Merge history and undo")
@@ -661,7 +783,7 @@ def app():
             try:
                 selection_response = st.dataframe(
                     history_df,
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                     selection_mode="multi-row",
                     # Streamlit dataframe row selection currently requires rerun to refresh
@@ -701,7 +823,7 @@ def app():
 
                 if st.button(
                     "Undo selected merges",
-                    use_container_width=True,
+                    width="stretch",
                     key="undo_selected_merges_button",
                     disabled=undo_disabled,
                 ):
@@ -721,9 +843,9 @@ def app():
                     st.session_state.pop("merge_history_selection_table", None)
                     st.rerun()
             else:
-                st.dataframe(history_df, use_container_width=True, hide_index=True, key="merge_history_fallback_table")
+                st.dataframe(history_df, width="stretch", hide_index=True, key="merge_history_fallback_table")
                 selected_merge = st.selectbox("Select a merge to undo", history_df["merge_id"].tolist(), key="selected_merge_to_undo")
-                if st.button("Undo selected merges", use_container_width=True, key="undo_selected_merges_fallback_button"):
+                if st.button("Undo selected merges", width="stretch", key="undo_selected_merges_fallback_button"):
                     selected = history_df[history_df["merge_id"] == selected_merge].iloc[0]
                     if selected["merge_source"] == "auto_group":
                         st.session_state["auto_status"].pop(selected_merge, None)
@@ -733,9 +855,9 @@ def app():
                     st.rerun()
 
         st.markdown("#### Current canonical mapping")
-        st.dataframe(mapping_df, use_container_width=True, hide_index=True)
+        st.dataframe(mapping_df, width="stretch", hide_index=True)
         st.markdown("#### Manual decision records")
-        st.dataframe(pd.DataFrame(active_manual_decisions.values()), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(active_manual_decisions.values()), width="stretch", hide_index=True)
 
     with tabs[3]:
         st.subheader("Export")
@@ -756,7 +878,7 @@ def app():
         )
         session_bytes = json.dumps(session_payload, indent=2).encode("utf-8")
         uploaded_session = st.file_uploader("Upload review session JSON", type=["json"], key="session_upload")
-        if st.button("Load review session", use_container_width=False, key="load_review_session_button"):
+        if st.button("Load review session", width="content", key="load_review_session_button"):
             if uploaded_session is None:
                 st.warning("Please upload a review session JSON first.")
             else:
@@ -798,9 +920,9 @@ def app():
             workbook_bytes=file_bytes,
         )
         st.markdown("#### Primary export")
-        st.download_button("Download cleaned workbook", cleaned_bytes, cleaned_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, key="download_cleaned_workbook")
+        st.download_button("Download cleaned workbook", cleaned_bytes, cleaned_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch", key="download_cleaned_workbook")
         st.caption("Exports a reviewed copy of the workbook. The original uploaded file is not overwritten.")
-        st.download_button("Download standardized workbook", standardized_bytes, standardized_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, key="download_standardized_workbook")
+        st.download_button("Download standardized workbook", standardized_bytes, standardized_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch", key="download_standardized_workbook")
         st.caption("This export replaces the selected entity column with reviewed canonical values only. It does not add audit columns.")
         with st.expander("Continue later", expanded=True):
             st.download_button(
@@ -808,14 +930,14 @@ def app():
                 session_bytes,
                 "ship_review_session.json",
                 "application/json",
-                use_container_width=True,
+                width="stretch",
                 key="download_review_session_json",
             )
         with st.expander("Audit exports", expanded=True):
-            st.download_button("auto decisions CSV", make_download_bytes(auto_export if not auto_export.empty else pd.DataFrame()), "ship_auto_merge_decisions.csv", "text/csv", use_container_width=True, key="download_auto_decisions_csv")
-            st.download_button("manual decisions CSV", make_download_bytes(pair_export if not pair_export.empty else pd.DataFrame()), "ship_manual_review_decisions.csv", "text/csv", use_container_width=True, key="download_manual_decisions_csv")
-            st.download_button("merge history CSV", make_download_bytes(history_df if not history_df.empty else pd.DataFrame()), "ship_merge_history.csv", "text/csv", use_container_width=True, key="download_merge_history_csv")
-            st.download_button("canonical mapping CSV", make_download_bytes(mapping_df if not mapping_df.empty else pd.DataFrame()), "ship_canonical_mapping.csv", "text/csv", use_container_width=True, key="download_canonical_mapping_csv")
+            st.download_button("auto decisions CSV", make_download_bytes(auto_export if not auto_export.empty else pd.DataFrame()), "ship_auto_merge_decisions.csv", "text/csv", width="stretch", key="download_auto_decisions_csv")
+            st.download_button("manual decisions CSV", make_download_bytes(pair_export if not pair_export.empty else pd.DataFrame()), "ship_manual_review_decisions.csv", "text/csv", width="stretch", key="download_manual_decisions_csv")
+            st.download_button("merge history CSV", make_download_bytes(history_df if not history_df.empty else pd.DataFrame()), "ship_merge_history.csv", "text/csv", width="stretch", key="download_merge_history_csv")
+            st.download_button("canonical mapping CSV", make_download_bytes(mapping_df if not mapping_df.empty else pd.DataFrame()), "ship_canonical_mapping.csv", "text/csv", width="stretch", key="download_canonical_mapping_csv")
 
 if __name__ == "__main__":
     app()
