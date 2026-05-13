@@ -76,6 +76,16 @@ def reset_decision_state():
     if "pair_decisions" in st.session_state:
         st.session_state["pair_decisions"] = {}
 
+def has_saved_manual_decision(pair_key: str, entity_column: str) -> bool:
+    record = st.session_state.get("manual_decisions", {}).get(pair_key)
+    if not isinstance(record, dict):
+        return False
+    return record.get("entity_column") == entity_column and record.get("decision") in VALID_MANUAL_DECISIONS
+
+def undo_manual_decision_for_pair(pair_key: str):
+    st.session_state.get("manual_decisions", {}).pop(pair_key, None)
+    st.session_state.pop(f"reviewer_comment_{pair_key}", None)
+
 def mapping_fingerprint(sheet_name: str, available_cols: list[str], entity_column: str) -> str:
     payload = {
         "sheet": sheet_name,
@@ -765,6 +775,7 @@ def app():
             row = visible_queue_df.iloc[idx]
             existing_decision_record = active_manual_decisions.get(row["pair_key"], {})
             decision = existing_decision_record.get("decision", "unreviewed")
+            has_current_decision = has_saved_manual_decision(row["pair_key"], column_config["entity_column"])
             saved_reviewer_comment = existing_decision_record.get("reviewer_comment", "") or ""
             reviewer_comment_key = f"reviewer_comment_{row['pair_key']}"
             if reviewer_comment_key not in st.session_state:
@@ -823,13 +834,20 @@ def app():
                 if not hide_reviewed_candidates:
                     st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
-            if nav[4].button("Undo", width="stretch", key="manual_undo_button"):
-                st.session_state["manual_decisions"].pop(row["pair_key"], None)
-                st.session_state.pop(reviewer_comment_key, None)
+            if nav[4].button(
+                "Undo",
+                width="stretch",
+                key="manual_undo_button",
+                disabled=not has_current_decision,
+                help="Undo this pair's saved decision (merge / keep separate / unsure).",
+            ):
+                undo_manual_decision_for_pair(row["pair_key"])
                 st.rerun()
             if nav[5].button("Next", width="stretch", key="manual_next_button"):
                 st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
+            if not has_current_decision:
+                st.caption("No saved decision for this pair yet. Undo is enabled after Merge, Keep separate, or Unsure.")
 
             st.markdown("#### Why this pair was flagged")
             st.write(row["reasons"])
