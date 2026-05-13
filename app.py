@@ -577,7 +577,45 @@ def app():
     dashboard2[1].metric("Kept separate", separate_count)
     dashboard2[2].metric("Unsure", unsure_count)
 
-    tabs = st.tabs(["Safe Auto-Merges", "Manual Review Queue", "Merge History", "Export"])
+    review_history_records = []
+    for _, row in auto_groups_df.iterrows():
+        auto_decision_status = st.session_state["auto_status"].get(row["auto_group_key"], "pending")
+        if auto_decision_status in VALID_AUTO_STATUSES:
+            review_history_records.append({
+                "decision_type": "auto_decision",
+                "decision": auto_decision_status,
+                "merge_source": "auto_group",
+                "decision_id": row["auto_group_key"],
+                "name_a": row.get("canonical_name", ""),
+                "name_b": row.get("member_names", ""),
+                "suggested_canonical": row.get("canonical_name", ""),
+                "score": None,
+                "reasons": row.get("reasons", ""),
+                "reviewer_comment": "",
+                "status": "active",
+            })
+    for pair_key, record in active_manual_decisions.items():
+        review_history_records.append({
+            "decision_type": "manual_decision",
+            "decision": record.get("decision", ""),
+            "merge_source": "manual_pair",
+            "decision_id": pair_key,
+            "name_a": record.get("name_a", ""),
+            "name_b": record.get("name_b", ""),
+            "suggested_canonical": record.get("suggested_canonical", ""),
+            "score": record.get("score", None),
+            "reasons": record.get("reasons", ""),
+            "reviewer_comment": record.get("reviewer_comment", ""),
+            "status": "active",
+        })
+    review_history_df = pd.DataFrame(review_history_records)
+    if not review_history_df.empty:
+        review_history_df = review_history_df.sort_values(
+            ["decision_type", "decision", "decision_id"],
+            ascending=[True, True, True],
+        ).reset_index(drop=True)
+
+    tabs = st.tabs(["Safe Auto-Merges", "Manual Review Queue", "Review History", "Export"])
 
     with tabs[0]:
         st.subheader("Safe auto-merges")
@@ -806,93 +844,113 @@ def app():
                     st.dataframe(right_rows, width="stretch", hide_index=True)
 
     with tabs[2]:
-        st.subheader("Merge history and undo")
-        st.write("Every active merge appears here with the reason it was merged. You can undo anything from this list.")
+        st.subheader("Review history and undo")
+        st.write("All saved review decisions appear here. You can filter and undo selected decisions.")
         merge_history_undo_feedback = st.session_state.pop("merge_history_undo_feedback", None)
         if merge_history_undo_feedback:
             st.success(merge_history_undo_feedback)
 
-        if history_df.empty:
-            st.info("No active merges yet.")
+        decision_filter = st.selectbox(
+            "Decision filter",
+            ["All decisions", "Merged", "Kept separate", "Unsure", "Auto decisions"],
+            index=0,
+            key="review_history_decision_filter",
+        )
+        if review_history_df.empty:
+            st.info("No review decisions yet.")
         else:
-            st.markdown("#### Active merge history")
-            selected_row_indexes = []
-            selection_supported = True
-            selection_response = None
+            filter_map = {
+                "Merged": lambda df: df[df["decision"] == "merge"],
+                "Kept separate": lambda df: df[df["decision"] == "keep_separate"],
+                "Unsure": lambda df: df[df["decision"] == "unsure"],
+                "Auto decisions": lambda df: df[df["decision_type"] == "auto_decision"],
+            }
+            filtered_review_history_df = review_history_df.copy()
+            if decision_filter in filter_map:
+                filtered_review_history_df = filter_map[decision_filter](filtered_review_history_df).reset_index(drop=True)
 
-            try:
-                selection_response = st.dataframe(
-                    history_df,
-                    width="stretch",
-                    hide_index=True,
-                    selection_mode="multi-row",
-                    # Streamlit dataframe row selection currently requires rerun to refresh
-                    # selected rows in session state.
-                    on_select="rerun",
-                    key="merge_history_selection_table",
-                )
-            except TypeError:
-                selection_supported = False
-
-            if selection_supported:
-                selected_rows = []
-
-                def extract_rows(selection_obj):
-                    if selection_obj is None:
-                        return []
-                    if hasattr(selection_obj, "selection"):
-                        selection_attr = selection_obj.selection
-                        if hasattr(selection_attr, "rows"):
-                            return list(selection_attr.rows or [])
-                        if isinstance(selection_attr, dict):
-                            return list(selection_attr.get("rows", []) or [])
-                    if isinstance(selection_obj, dict):
-                        return list(selection_obj.get("selection", {}).get("rows", []) or [])
-                    return []
-
-                selected_rows = extract_rows(selection_response)
-                if not selected_rows:
-                    selected_rows = extract_rows(st.session_state.get("merge_history_selection_table"))
-
-                unique_rows = sorted({int(row_idx) for row_idx in selected_rows if isinstance(row_idx, int) or str(row_idx).isdigit()})
-                selected_row_indexes = [row_idx for row_idx in unique_rows if 0 <= row_idx < len(history_df)]
-
-                undo_disabled = len(selected_row_indexes) == 0
-                if undo_disabled:
-                    st.caption("Select one or more merge-history rows to undo.")
-
-                if st.button(
-                    "Undo selected merges",
-                    width="stretch",
-                    key="undo_selected_merges_button",
-                    disabled=undo_disabled,
-                ):
-                    selected_records = history_df.iloc[selected_row_indexes].to_dict(orient="records")
-                    merge_targets = {(record["merge_source"], record["merge_id"]) for record in selected_records}
-                    for merge_source, merge_id in merge_targets:
-                        if merge_source == "auto_group":
-                            st.session_state["auto_status"].pop(merge_id, None)
-                        else:
-                            st.session_state["manual_decisions"].pop(merge_id, None)
-                    undone_count = len(merge_targets)
-                    st.session_state["merge_history_undo_feedback"] = (
-                        f"Undid {undone_count} selected merge."
-                        if undone_count == 1
-                        else f"Undid {undone_count} selected merges."
-                    )
-                    st.session_state.pop("merge_history_selection_table", None)
-                    st.rerun()
+            if filtered_review_history_df.empty:
+                st.info("No decisions match this filter.")
             else:
-                st.dataframe(history_df, width="stretch", hide_index=True, key="merge_history_fallback_table")
-                selected_merge = st.selectbox("Select a merge to undo", history_df["merge_id"].tolist(), key="selected_merge_to_undo")
-                if st.button("Undo selected merges", width="stretch", key="undo_selected_merges_fallback_button"):
-                    selected = history_df[history_df["merge_id"] == selected_merge].iloc[0]
-                    if selected["merge_source"] == "auto_group":
-                        st.session_state["auto_status"].pop(selected_merge, None)
-                    else:
-                        st.session_state["manual_decisions"].pop(selected_merge, None)
-                    st.session_state["merge_history_undo_feedback"] = "Undid 1 selected merge."
-                    st.rerun()
+                st.markdown("#### Active review history")
+                selected_row_indexes = []
+                selection_supported = True
+                selection_response = None
+
+                try:
+                    selection_response = st.dataframe(
+                        filtered_review_history_df,
+                        width="stretch",
+                        hide_index=True,
+                        selection_mode="multi-row",
+                        # Streamlit dataframe row selection currently requires rerun to refresh
+                        # selected rows in session state.
+                        on_select="rerun",
+                        key="merge_history_selection_table",
+                    )
+                except TypeError:
+                    selection_supported = False
+
+                if selection_supported:
+                    selected_rows = []
+
+                    def extract_rows(selection_obj):
+                        if selection_obj is None:
+                            return []
+                        if hasattr(selection_obj, "selection"):
+                            selection_attr = selection_obj.selection
+                            if hasattr(selection_attr, "rows"):
+                                return list(selection_attr.rows or [])
+                            if isinstance(selection_attr, dict):
+                                return list(selection_attr.get("rows", []) or [])
+                        if isinstance(selection_obj, dict):
+                            return list(selection_obj.get("selection", {}).get("rows", []) or [])
+                        return []
+
+                    selected_rows = extract_rows(selection_response)
+                    if not selected_rows:
+                        selected_rows = extract_rows(st.session_state.get("merge_history_selection_table"))
+
+                    unique_rows = sorted({int(row_idx) for row_idx in selected_rows if isinstance(row_idx, int) or str(row_idx).isdigit()})
+                    selected_row_indexes = [row_idx for row_idx in unique_rows if 0 <= row_idx < len(filtered_review_history_df)]
+
+                    undo_disabled = len(selected_row_indexes) == 0
+                    if undo_disabled:
+                        st.caption("Select one or more review-history rows to undo.")
+
+                    if st.button(
+                        "Undo selected decisions",
+                        width="stretch",
+                        key="undo_selected_merges_button",
+                        disabled=undo_disabled,
+                    ):
+                        selected_records = filtered_review_history_df.iloc[selected_row_indexes].to_dict(orient="records")
+                        decision_targets = {(record["decision_type"], record["decision_id"]) for record in selected_records}
+                        for decision_type, decision_id in decision_targets:
+                            if decision_type == "auto_decision":
+                                st.session_state["auto_status"].pop(decision_id, None)
+                            else:
+                                st.session_state["manual_decisions"].pop(decision_id, None)
+                        undone_count = len(decision_targets)
+                        st.session_state["merge_history_undo_feedback"] = (
+                            f"Undid {undone_count} selected decision."
+                            if undone_count == 1
+                            else f"Undid {undone_count} selected decisions."
+                        )
+                        st.session_state.pop("merge_history_selection_table", None)
+                        st.rerun()
+                else:
+                    st.dataframe(filtered_review_history_df, width="stretch", hide_index=True, key="merge_history_fallback_table")
+                    fallback_options = filtered_review_history_df["decision_id"].tolist()
+                    selected_decision = st.selectbox("Select a decision to undo", fallback_options, key="selected_merge_to_undo")
+                    if st.button("Undo selected decisions", width="stretch", key="undo_selected_merges_fallback_button"):
+                        selected = filtered_review_history_df[filtered_review_history_df["decision_id"] == selected_decision].iloc[0]
+                        if selected["decision_type"] == "auto_decision":
+                            st.session_state["auto_status"].pop(selected_decision, None)
+                        else:
+                            st.session_state["manual_decisions"].pop(selected_decision, None)
+                        st.session_state["merge_history_undo_feedback"] = "Undid 1 selected decision."
+                        st.rerun()
 
         st.markdown("#### Current canonical mapping")
         st.dataframe(mapping_df, width="stretch", hide_index=True)

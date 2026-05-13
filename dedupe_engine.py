@@ -828,7 +828,8 @@ def build_cleaned_workbook_bytes(raw_df: pd.DataFrame, mapping_df: pd.DataFrame,
                 source_map[name] = 'manual_unsure'
             score_map[name] = rec.get('score', '')
             reason_map[name] = rec.get('reasons', '')
-            reviewer_comment_map[name] = reviewer_comment
+            if decision == 'merge' or name in merged_values:
+                reviewer_comment_map[name] = reviewer_comment
     unreviewed_names = set()
     if candidate_queue_df is not None and (not candidate_queue_df.empty):
         for _, row in candidate_queue_df.iterrows():
