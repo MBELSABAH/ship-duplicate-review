@@ -273,6 +273,28 @@ def show_summary_card(title: str, data: dict):
     if data.get("sample_notes"):
         st.markdown(f"**Sample notes:** {data['sample_notes']}")
 
+def evidence_summary_from_scores(evidence_scores: object) -> str:
+    if not isinstance(evidence_scores, list):
+        return ""
+    parts = []
+    for item in evidence_scores:
+        if not isinstance(item, dict):
+            continue
+        column = str(item.get("column") or "evidence").strip()
+        reason = str(item.get("reason") or "").strip()
+        if reason:
+            if reason.lower().startswith(f"{column.lower()}:"):
+                parts.append(reason)
+            else:
+                parts.append(f"{column}: {reason}")
+            continue
+        score_value = item.get("score")
+        if isinstance(score_value, (int, float)):
+            parts.append(f"{column}: score {score_value:.2f}")
+        else:
+            parts.append(column)
+    return " | ".join(parts)
+
 def app():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     init_state()
@@ -285,22 +307,28 @@ def app():
         uploaded = st.file_uploader("Upload workbook", type=["xlsx", "xls"], key="upload_workbook")
         st.subheader("Matching")
         fuzzy_threshold = st.slider(
-            "Name-match strictness",
+            "Name similarity cutoff",
             60,
             98,
             88,
             1,
             key="name_match_strictness_slider",
-            help="Controls whether a pair is generated at all. Lower this if an expected pair is missing.",
+            help=(
+                "Controls which name pairs enter the review queue. Higher = fewer candidates with more similar names. "
+                "Lower = more candidates, more noise. Strong selected factors can still surface borderline names."
+            ),
         )
         min_manual_score = st.slider(
-            "Overall evidence threshold",
+            "Minimum final score",
             0.0,
             1.0,
             0.75,
             0.01,
             key="overall_evidence_threshold_slider",
-            help="Filters generated pairs by combined evidence score. Lower this if generated pairs are hidden.",
+            help=(
+                "Filters generated candidates after name similarity and selected dedupe factors are scored together. "
+                "Higher = only stronger overall matches are shown."
+            ),
         )
         st.subheader("Review")
         hide_reviewed_candidates = st.checkbox(
@@ -591,10 +619,12 @@ def app():
                 "suggested_canonical": row.get("canonical_name", ""),
                 "score": None,
                 "reasons": row.get("reasons", ""),
+                "evidence_summary": "",
                 "reviewer_comment": "",
                 "status": "active",
             })
     for pair_key, record in active_manual_decisions.items():
+        evidence_summary = evidence_summary_from_scores(record.get("evidence_scores", []))
         review_history_records.append({
             "decision_type": "manual_decision",
             "decision": record.get("decision", ""),
@@ -605,6 +635,7 @@ def app():
             "suggested_canonical": record.get("suggested_canonical", ""),
             "score": record.get("score", None),
             "reasons": record.get("reasons", ""),
+            "evidence_summary": evidence_summary,
             "reviewer_comment": record.get("reviewer_comment", ""),
             "status": "active",
         })
@@ -722,7 +753,7 @@ def app():
         st.write("These are the remaining ambiguous candidates after any accepted safe auto-merges are removed from review.")
 
         st.caption(f"Diagnostics — generated: {len(full_queue_df)} | score-filtered: {len(score_filtered_queue_df)} | visible: {len(visible_queue_df)} | reviewed hidden: {reviewed_hidden_count}")
-        st.caption("Name-match strictness controls candidate generation. Overall evidence threshold filters generated candidates.")
+        st.caption("Name similarity cutoff controls candidate generation. Minimum final score filters generated candidates after evidence scoring.")
 
         if visible_queue_df is None or visible_queue_df.empty:
             st.success("No visible manual-review candidates under the current settings.")
@@ -823,8 +854,7 @@ def app():
                 st.dataframe(evidence_df, width="stretch", hide_index=True)
 
             selected_cols = [column_config["entity_column"]] + [f.get("column") for f in column_config.get("evidence_fields", []) if f.get("column")]
-            id_candidates = ["OID", "Volume", "Page", "Day", "Month", "Year", "Entry no."]
-            display_columns = [c for c in selected_cols + id_candidates if c and c in raw_df.columns]
+            display_columns = [c for c in selected_cols if c and c in raw_df.columns]
             display_columns = list(dict.fromkeys(display_columns))
             left_all_rows = raw_df[raw_df[column_config["entity_column"]].fillna("").astype(str).str.strip() == row["name_a"]][display_columns]
             right_all_rows = raw_df[raw_df[column_config["entity_column"]].fillna("").astype(str).str.strip() == row["name_b"]][display_columns]
@@ -955,7 +985,26 @@ def app():
         st.markdown("#### Current canonical mapping")
         st.dataframe(mapping_df, width="stretch", hide_index=True)
         st.markdown("#### Manual decision records")
-        st.dataframe(pd.DataFrame(active_manual_decisions.values()), width="stretch", hide_index=True)
+        manual_decisions_df = pd.DataFrame(active_manual_decisions.values())
+        if not manual_decisions_df.empty:
+            manual_decisions_df = manual_decisions_df.copy()
+            if "evidence_scores" in manual_decisions_df.columns:
+                manual_decisions_df["evidence_summary"] = manual_decisions_df["evidence_scores"].apply(evidence_summary_from_scores)
+                manual_decisions_df = manual_decisions_df.drop(columns=["evidence_scores"])
+            display_columns = [
+                "decision",
+                "name_a",
+                "name_b",
+                "suggested_canonical",
+                "score",
+                "reasons",
+                "evidence_summary",
+                "reviewer_comment",
+            ]
+            available_display_columns = [col for col in display_columns if col in manual_decisions_df.columns]
+            if available_display_columns:
+                manual_decisions_df = manual_decisions_df[available_display_columns]
+        st.dataframe(manual_decisions_df, width="stretch", hide_index=True)
 
     with tabs[3]:
         st.subheader("Export")
