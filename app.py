@@ -76,6 +76,16 @@ def reset_decision_state():
     if "pair_decisions" in st.session_state:
         st.session_state["pair_decisions"] = {}
 
+def has_saved_manual_decision(pair_key: str, entity_column: str) -> bool:
+    record = st.session_state.get("manual_decisions", {}).get(pair_key)
+    if not isinstance(record, dict):
+        return False
+    return record.get("entity_column") == entity_column and record.get("decision") in VALID_MANUAL_DECISIONS
+
+def undo_manual_decision_for_pair(pair_key: str):
+    st.session_state.get("manual_decisions", {}).pop(pair_key, None)
+    st.session_state.pop(f"reviewer_comment_{pair_key}", None)
+
 def mapping_fingerprint(sheet_name: str, available_cols: list[str], entity_column: str) -> str:
     payload = {
         "sheet": sheet_name,
@@ -233,6 +243,9 @@ def validate_session_payload(data: object) -> tuple[bool, str, dict]:
         decision = record.get("decision")
         if decision not in VALID_MANUAL_DECISIONS:
             return False, f"Invalid session format. manual_decisions entry `{pair_key}` has invalid decision `{decision}`.", {}
+        reviewer_comment = record.get("reviewer_comment", "")
+        if reviewer_comment is not None and not isinstance(reviewer_comment, str):
+            return False, f"Invalid session format. manual_decisions entry `{pair_key}` has invalid reviewer_comment type.", {}
     return True, "", data
 
 def build_session_payload(
@@ -270,6 +283,28 @@ def show_summary_card(title: str, data: dict):
     if data.get("sample_notes"):
         st.markdown(f"**Sample notes:** {data['sample_notes']}")
 
+def evidence_summary_from_scores(evidence_scores: object) -> str:
+    if not isinstance(evidence_scores, list):
+        return ""
+    parts = []
+    for item in evidence_scores:
+        if not isinstance(item, dict):
+            continue
+        column = str(item.get("column") or "evidence").strip()
+        reason = str(item.get("reason") or "").strip()
+        if reason:
+            if reason.lower().startswith(f"{column.lower()}:"):
+                parts.append(reason)
+            else:
+                parts.append(f"{column}: {reason}")
+            continue
+        score_value = item.get("score")
+        if isinstance(score_value, (int, float)):
+            parts.append(f"{column}: score {score_value:.2f}")
+        else:
+            parts.append(column)
+    return " | ".join(parts)
+
 def app():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     init_state()
@@ -282,22 +317,28 @@ def app():
         uploaded = st.file_uploader("Upload workbook", type=["xlsx", "xls"], key="upload_workbook")
         st.subheader("Matching")
         fuzzy_threshold = st.slider(
-            "Name-match strictness",
+            "Name similarity cutoff",
             60,
             98,
             88,
             1,
             key="name_match_strictness_slider",
-            help="Controls whether a pair is generated at all. Lower this if an expected pair is missing.",
+            help=(
+                "Controls which name pairs enter the review queue. Higher = fewer candidates with more similar names. "
+                "Lower = more candidates, more noise. Strong selected factors can still surface borderline names."
+            ),
         )
         min_manual_score = st.slider(
-            "Overall evidence threshold",
+            "Minimum final score",
             0.0,
             1.0,
             0.75,
             0.01,
             key="overall_evidence_threshold_slider",
-            help="Filters generated pairs by combined evidence score. Lower this if generated pairs are hidden.",
+            help=(
+                "Filters generated candidates after name similarity and selected dedupe factors are scored together. "
+                "Higher = only stronger overall matches are shown."
+            ),
         )
         st.subheader("Review")
         hide_reviewed_candidates = st.checkbox(
@@ -386,7 +427,11 @@ def app():
                 st.session_state["evidence_fields_fingerprint"] = mapping_fingerprint(sheet_name, available_cols, saved_entity_column)
                 st.session_state["column_config"] = saved_cfg
                 st.session_state["auto_status"] = pending_loaded_session.get("auto_status", {})
-                st.session_state["manual_decisions"] = pending_loaded_session.get("manual_decisions", {})
+                loaded_manual_decisions = pending_loaded_session.get("manual_decisions", {})
+                for record in loaded_manual_decisions.values():
+                    if isinstance(record, dict):
+                        record.setdefault("reviewer_comment", "")
+                st.session_state["manual_decisions"] = loaded_manual_decisions
                 st.session_state["auto_index"] = 0
                 st.session_state["pair_index"] = 0
                 st.session_state["queue_settings_fingerprint"] = None
@@ -570,7 +615,48 @@ def app():
     dashboard2[1].metric("Kept separate", separate_count)
     dashboard2[2].metric("Unsure", unsure_count)
 
-    tabs = st.tabs(["Safe Auto-Merges", "Manual Review Queue", "Merge History", "Export"])
+    review_history_records = []
+    for _, row in auto_groups_df.iterrows():
+        auto_decision_status = st.session_state["auto_status"].get(row["auto_group_key"], "pending")
+        if auto_decision_status in VALID_AUTO_STATUSES:
+            review_history_records.append({
+                "decision_type": "auto_decision",
+                "decision": auto_decision_status,
+                "merge_source": "auto_group",
+                "decision_id": row["auto_group_key"],
+                "name_a": row.get("canonical_name", ""),
+                "name_b": row.get("member_names", ""),
+                "suggested_canonical": row.get("canonical_name", ""),
+                "score": None,
+                "reasons": row.get("reasons", ""),
+                "evidence_summary": "",
+                "reviewer_comment": "",
+                "status": "active",
+            })
+    for pair_key, record in active_manual_decisions.items():
+        evidence_summary = evidence_summary_from_scores(record.get("evidence_scores", []))
+        review_history_records.append({
+            "decision_type": "manual_decision",
+            "decision": record.get("decision", ""),
+            "merge_source": "manual_pair",
+            "decision_id": pair_key,
+            "name_a": record.get("name_a", ""),
+            "name_b": record.get("name_b", ""),
+            "suggested_canonical": record.get("suggested_canonical", ""),
+            "score": record.get("score", None),
+            "reasons": record.get("reasons", ""),
+            "evidence_summary": evidence_summary,
+            "reviewer_comment": record.get("reviewer_comment", ""),
+            "status": "active",
+        })
+    review_history_df = pd.DataFrame(review_history_records)
+    if not review_history_df.empty:
+        review_history_df = review_history_df.sort_values(
+            ["decision_type", "decision", "decision_id"],
+            ascending=[True, True, True],
+        ).reset_index(drop=True)
+
+    tabs = st.tabs(["Safe Auto-Merges", "Manual Review Queue", "Review History", "Export"])
 
     with tabs[0]:
         st.subheader("Safe auto-merges")
@@ -677,7 +763,7 @@ def app():
         st.write("These are the remaining ambiguous candidates after any accepted safe auto-merges are removed from review.")
 
         st.caption(f"Diagnostics — generated: {len(full_queue_df)} | score-filtered: {len(score_filtered_queue_df)} | visible: {len(visible_queue_df)} | reviewed hidden: {reviewed_hidden_count}")
-        st.caption("Name-match strictness controls candidate generation. Overall evidence threshold filters generated candidates.")
+        st.caption("Name similarity cutoff controls candidate generation. Minimum final score filters generated candidates after evidence scoring.")
 
         if visible_queue_df is None or visible_queue_df.empty:
             st.success("No visible manual-review candidates under the current settings.")
@@ -687,7 +773,13 @@ def app():
             idx = min(st.session_state["pair_index"], len(visible_queue_df) - 1)
             st.session_state["pair_index"] = idx
             row = visible_queue_df.iloc[idx]
-            decision = active_manual_decisions.get(row["pair_key"], {}).get("decision", "unreviewed")
+            existing_decision_record = active_manual_decisions.get(row["pair_key"], {})
+            decision = existing_decision_record.get("decision", "unreviewed")
+            has_current_decision = has_saved_manual_decision(row["pair_key"], column_config["entity_column"])
+            saved_reviewer_comment = existing_decision_record.get("reviewer_comment", "") or ""
+            reviewer_comment_key = f"reviewer_comment_{row['pair_key']}"
+            if reviewer_comment_key not in st.session_state:
+                st.session_state[reviewer_comment_key] = saved_reviewer_comment
 
             with st.container(border=True):
                 info = st.columns([2, 1.3, 1.3, 2])
@@ -696,31 +788,66 @@ def app():
                 info[2].markdown(f"**Decision:** {decision}")
                 info[3].markdown(f"**Suggested canonical:** {row['suggested_canonical']}")
 
+            st.text_area(
+                "Reviewer comment / reasoning",
+                key=reviewer_comment_key,
+                help="Optional note explaining why this pair should be merged, kept separate, or marked unsure.",
+                placeholder=(
+                    "e.g., same vessel type and cargo pattern, but transcription is uncertain\n"
+                    "e.g., names are similar but years are too far apart\n"
+                    "e.g., reviewer recognizes this as a common spelling variant"
+                ),
+            )
+            current_reviewer_comment = st.session_state.get(reviewer_comment_key, "")
+
             nav = st.columns(6)
             if nav[0].button("Previous", width="stretch", key="manual_prev_button"):
                 st.session_state["pair_index"] = max(st.session_state["pair_index"] - 1, 0)
                 st.rerun()
             if nav[1].button("Merge", width="stretch", key="manual_merge_button"):
-                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "merge", column_config["entity_column"])
+                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(
+                    row,
+                    "merge",
+                    column_config["entity_column"],
+                    reviewer_comment=current_reviewer_comment,
+                )
                 if not hide_reviewed_candidates:
                     st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
             if nav[2].button("Keep separate", width="stretch", key="manual_keep_separate_button"):
-                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "keep_separate", column_config["entity_column"])
+                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(
+                    row,
+                    "keep_separate",
+                    column_config["entity_column"],
+                    reviewer_comment=current_reviewer_comment,
+                )
                 if not hide_reviewed_candidates:
                     st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
             if nav[3].button("Unsure", width="stretch", key="manual_unsure_button"):
-                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(row, "unsure", column_config["entity_column"])
+                st.session_state["manual_decisions"][row["pair_key"]] = build_manual_decision_record(
+                    row,
+                    "unsure",
+                    column_config["entity_column"],
+                    reviewer_comment=current_reviewer_comment,
+                )
                 if not hide_reviewed_candidates:
                     st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
-            if nav[4].button("Undo", width="stretch", key="manual_undo_button"):
-                st.session_state["manual_decisions"].pop(row["pair_key"], None)
+            if nav[4].button(
+                "Undo",
+                width="stretch",
+                key="manual_undo_button",
+                disabled=not has_current_decision,
+                help="Undo this pair's saved decision (merge / keep separate / unsure).",
+            ):
+                undo_manual_decision_for_pair(row["pair_key"])
                 st.rerun()
             if nav[5].button("Next", width="stretch", key="manual_next_button"):
                 st.session_state["pair_index"] = min(st.session_state["pair_index"] + 1, len(visible_queue_df) - 1)
                 st.rerun()
+            if not has_current_decision:
+                st.caption("No saved decision for this pair yet. Undo is enabled after Merge, Keep separate, or Unsure.")
 
             st.markdown("#### Why this pair was flagged")
             st.write(row["reasons"])
@@ -745,8 +872,7 @@ def app():
                 st.dataframe(evidence_df, width="stretch", hide_index=True)
 
             selected_cols = [column_config["entity_column"]] + [f.get("column") for f in column_config.get("evidence_fields", []) if f.get("column")]
-            id_candidates = ["OID", "Volume", "Page", "Day", "Month", "Year", "Entry no."]
-            display_columns = [c for c in selected_cols + id_candidates if c and c in raw_df.columns]
+            display_columns = [c for c in selected_cols if c and c in raw_df.columns]
             display_columns = list(dict.fromkeys(display_columns))
             left_all_rows = raw_df[raw_df[column_config["entity_column"]].fillna("").astype(str).str.strip() == row["name_a"]][display_columns]
             right_all_rows = raw_df[raw_df[column_config["entity_column"]].fillna("").astype(str).str.strip() == row["name_b"]][display_columns]
@@ -766,98 +892,137 @@ def app():
                     st.dataframe(right_rows, width="stretch", hide_index=True)
 
     with tabs[2]:
-        st.subheader("Merge history and undo")
-        st.write("Every active merge appears here with the reason it was merged. You can undo anything from this list.")
+        st.subheader("Review history and undo")
+        st.write("All saved review decisions appear here. You can filter and undo selected decisions.")
         merge_history_undo_feedback = st.session_state.pop("merge_history_undo_feedback", None)
         if merge_history_undo_feedback:
             st.success(merge_history_undo_feedback)
 
-        if history_df.empty:
-            st.info("No active merges yet.")
+        decision_filter = st.selectbox(
+            "Decision filter",
+            ["All decisions", "Merged", "Kept separate", "Unsure", "Auto decisions"],
+            index=0,
+            key="review_history_decision_filter",
+        )
+        if review_history_df.empty:
+            st.info("No review decisions yet.")
         else:
-            st.markdown("#### Active merge history")
-            selected_row_indexes = []
-            selection_supported = True
-            selection_response = None
+            filter_map = {
+                "Merged": lambda df: df[df["decision"] == "merge"],
+                "Kept separate": lambda df: df[df["decision"] == "keep_separate"],
+                "Unsure": lambda df: df[df["decision"] == "unsure"],
+                "Auto decisions": lambda df: df[df["decision_type"] == "auto_decision"],
+            }
+            filtered_review_history_df = review_history_df.copy()
+            if decision_filter in filter_map:
+                filtered_review_history_df = filter_map[decision_filter](filtered_review_history_df).reset_index(drop=True)
 
-            try:
-                selection_response = st.dataframe(
-                    history_df,
-                    width="stretch",
-                    hide_index=True,
-                    selection_mode="multi-row",
-                    # Streamlit dataframe row selection currently requires rerun to refresh
-                    # selected rows in session state.
-                    on_select="rerun",
-                    key="merge_history_selection_table",
-                )
-            except TypeError:
-                selection_supported = False
-
-            if selection_supported:
-                selected_rows = []
-
-                def extract_rows(selection_obj):
-                    if selection_obj is None:
-                        return []
-                    if hasattr(selection_obj, "selection"):
-                        selection_attr = selection_obj.selection
-                        if hasattr(selection_attr, "rows"):
-                            return list(selection_attr.rows or [])
-                        if isinstance(selection_attr, dict):
-                            return list(selection_attr.get("rows", []) or [])
-                    if isinstance(selection_obj, dict):
-                        return list(selection_obj.get("selection", {}).get("rows", []) or [])
-                    return []
-
-                selected_rows = extract_rows(selection_response)
-                if not selected_rows:
-                    selected_rows = extract_rows(st.session_state.get("merge_history_selection_table"))
-
-                unique_rows = sorted({int(row_idx) for row_idx in selected_rows if isinstance(row_idx, int) or str(row_idx).isdigit()})
-                selected_row_indexes = [row_idx for row_idx in unique_rows if 0 <= row_idx < len(history_df)]
-
-                undo_disabled = len(selected_row_indexes) == 0
-                if undo_disabled:
-                    st.caption("Select one or more merge-history rows to undo.")
-
-                if st.button(
-                    "Undo selected merges",
-                    width="stretch",
-                    key="undo_selected_merges_button",
-                    disabled=undo_disabled,
-                ):
-                    selected_records = history_df.iloc[selected_row_indexes].to_dict(orient="records")
-                    merge_targets = {(record["merge_source"], record["merge_id"]) for record in selected_records}
-                    for merge_source, merge_id in merge_targets:
-                        if merge_source == "auto_group":
-                            st.session_state["auto_status"].pop(merge_id, None)
-                        else:
-                            st.session_state["manual_decisions"].pop(merge_id, None)
-                    undone_count = len(merge_targets)
-                    st.session_state["merge_history_undo_feedback"] = (
-                        f"Undid {undone_count} selected merge."
-                        if undone_count == 1
-                        else f"Undid {undone_count} selected merges."
-                    )
-                    st.session_state.pop("merge_history_selection_table", None)
-                    st.rerun()
+            if filtered_review_history_df.empty:
+                st.info("No decisions match this filter.")
             else:
-                st.dataframe(history_df, width="stretch", hide_index=True, key="merge_history_fallback_table")
-                selected_merge = st.selectbox("Select a merge to undo", history_df["merge_id"].tolist(), key="selected_merge_to_undo")
-                if st.button("Undo selected merges", width="stretch", key="undo_selected_merges_fallback_button"):
-                    selected = history_df[history_df["merge_id"] == selected_merge].iloc[0]
-                    if selected["merge_source"] == "auto_group":
-                        st.session_state["auto_status"].pop(selected_merge, None)
-                    else:
-                        st.session_state["manual_decisions"].pop(selected_merge, None)
-                    st.session_state["merge_history_undo_feedback"] = "Undid 1 selected merge."
-                    st.rerun()
+                st.markdown("#### Active review history")
+                selected_row_indexes = []
+                selection_supported = True
+                selection_response = None
+
+                try:
+                    selection_response = st.dataframe(
+                        filtered_review_history_df,
+                        width="stretch",
+                        hide_index=True,
+                        selection_mode="multi-row",
+                        # Streamlit dataframe row selection currently requires rerun to refresh
+                        # selected rows in session state.
+                        on_select="rerun",
+                        key="merge_history_selection_table",
+                    )
+                except TypeError:
+                    selection_supported = False
+
+                if selection_supported:
+                    selected_rows = []
+
+                    def extract_rows(selection_obj):
+                        if selection_obj is None:
+                            return []
+                        if hasattr(selection_obj, "selection"):
+                            selection_attr = selection_obj.selection
+                            if hasattr(selection_attr, "rows"):
+                                return list(selection_attr.rows or [])
+                            if isinstance(selection_attr, dict):
+                                return list(selection_attr.get("rows", []) or [])
+                        if isinstance(selection_obj, dict):
+                            return list(selection_obj.get("selection", {}).get("rows", []) or [])
+                        return []
+
+                    selected_rows = extract_rows(selection_response)
+                    if not selected_rows:
+                        selected_rows = extract_rows(st.session_state.get("merge_history_selection_table"))
+
+                    unique_rows = sorted({int(row_idx) for row_idx in selected_rows if isinstance(row_idx, int) or str(row_idx).isdigit()})
+                    selected_row_indexes = [row_idx for row_idx in unique_rows if 0 <= row_idx < len(filtered_review_history_df)]
+
+                    undo_disabled = len(selected_row_indexes) == 0
+                    if undo_disabled:
+                        st.caption("Select one or more review-history rows to undo.")
+
+                    if st.button(
+                        "Undo selected decisions",
+                        width="stretch",
+                        key="undo_selected_merges_button",
+                        disabled=undo_disabled,
+                    ):
+                        selected_records = filtered_review_history_df.iloc[selected_row_indexes].to_dict(orient="records")
+                        decision_targets = {(record["decision_type"], record["decision_id"]) for record in selected_records}
+                        for decision_type, decision_id in decision_targets:
+                            if decision_type == "auto_decision":
+                                st.session_state["auto_status"].pop(decision_id, None)
+                            else:
+                                st.session_state["manual_decisions"].pop(decision_id, None)
+                        undone_count = len(decision_targets)
+                        st.session_state["merge_history_undo_feedback"] = (
+                            f"Undid {undone_count} selected decision."
+                            if undone_count == 1
+                            else f"Undid {undone_count} selected decisions."
+                        )
+                        st.session_state.pop("merge_history_selection_table", None)
+                        st.rerun()
+                else:
+                    st.dataframe(filtered_review_history_df, width="stretch", hide_index=True, key="merge_history_fallback_table")
+                    fallback_options = filtered_review_history_df["decision_id"].tolist()
+                    selected_decision = st.selectbox("Select a decision to undo", fallback_options, key="selected_merge_to_undo")
+                    if st.button("Undo selected decisions", width="stretch", key="undo_selected_merges_fallback_button"):
+                        selected = filtered_review_history_df[filtered_review_history_df["decision_id"] == selected_decision].iloc[0]
+                        if selected["decision_type"] == "auto_decision":
+                            st.session_state["auto_status"].pop(selected_decision, None)
+                        else:
+                            st.session_state["manual_decisions"].pop(selected_decision, None)
+                        st.session_state["merge_history_undo_feedback"] = "Undid 1 selected decision."
+                        st.rerun()
 
         st.markdown("#### Current canonical mapping")
         st.dataframe(mapping_df, width="stretch", hide_index=True)
         st.markdown("#### Manual decision records")
-        st.dataframe(pd.DataFrame(active_manual_decisions.values()), width="stretch", hide_index=True)
+        manual_decisions_df = pd.DataFrame(active_manual_decisions.values())
+        if not manual_decisions_df.empty:
+            manual_decisions_df = manual_decisions_df.copy()
+            if "evidence_scores" in manual_decisions_df.columns:
+                manual_decisions_df["evidence_summary"] = manual_decisions_df["evidence_scores"].apply(evidence_summary_from_scores)
+                manual_decisions_df = manual_decisions_df.drop(columns=["evidence_scores"])
+            display_columns = [
+                "decision",
+                "name_a",
+                "name_b",
+                "suggested_canonical",
+                "score",
+                "reasons",
+                "evidence_summary",
+                "reviewer_comment",
+            ]
+            available_display_columns = [col for col in display_columns if col in manual_decisions_df.columns]
+            if available_display_columns:
+                manual_decisions_df = manual_decisions_df[available_display_columns]
+        st.dataframe(manual_decisions_df, width="stretch", hide_index=True)
 
     with tabs[3]:
         st.subheader("Export")
@@ -868,6 +1033,8 @@ def app():
             auto_export["members"] = auto_export["members_list"].map(lambda x: " | ".join(x))
             auto_export["members_list"] = auto_export["members_list"].map(lambda x: " | ".join(x))
         pair_export = pd.DataFrame(st.session_state["manual_decisions"].values())
+        if "reviewer_comment" not in pair_export.columns:
+            pair_export["reviewer_comment"] = ""
         source_filename = getattr(uploaded, "name", "") or "uploaded_workbook.xlsx"
         session_payload = build_session_payload(
             source_filename=source_filename,
@@ -891,6 +1058,11 @@ def app():
                     if not is_valid:
                         st.warning(validation_message)
                     else:
+                        for record in normalized_session.get("manual_decisions", {}).values():
+                            if isinstance(record, dict) and not isinstance(record.get("reviewer_comment", ""), str):
+                                record["reviewer_comment"] = ""
+                            elif isinstance(record, dict):
+                                record.setdefault("reviewer_comment", "")
                         st.session_state["pending_loaded_session"] = normalized_session
                         st.rerun()
 
