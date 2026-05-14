@@ -822,7 +822,6 @@ def app():
                 selected_open_group_key = None
 
             entity_values = raw_df[column_config["entity_column"]].fillna("").astype(str).str.strip()
-            overview_frames = []
             group_context_by_key = {}
             for _, group_row in visible_auto_groups_df.iterrows():
                 group_key = group_row["auto_group_key"]
@@ -835,59 +834,51 @@ def app():
                 else:
                     group_rows = pd.DataFrame(columns=safe_overview_columns)
                 evidence_summary = build_safe_group_evidence_summary(group_rows, selected_factor_columns)
-                display_rows = group_rows.copy()
-                if display_rows.empty:
-                    display_rows = pd.DataFrame([{column: "—" for column in safe_overview_columns}])
-                display_rows.insert(0, "Review", "Open group")
-                display_rows.insert(1, "Group", group_id)
-                display_rows["Evidence summary"] = evidence_summary
-                display_rows["Status"] = group_status
-                display_rows["auto_group_key"] = group_key
-                overview_frames.append(display_rows)
+                member_count_value = group_row.get("member_count", len(group_names))
+                if pd.notna(member_count_value):
+                    try:
+                        member_count = int(member_count_value)
+                    except (TypeError, ValueError):
+                        member_count = len(group_names)
+                else:
+                    member_count = len(group_names)
                 group_context_by_key[group_key] = {
                     "group_id": group_id,
                     "status": group_status,
                     "group_names": group_names,
                     "group_rows": group_rows,
                     "evidence_summary": evidence_summary,
+                    "canonical_name": group_row.get("canonical_name", ""),
+                    "member_count": member_count,
                 }
-
-            overview_df = (
-                pd.concat(overview_frames, ignore_index=True)
-                if overview_frames
-                else pd.DataFrame(columns=["Review", "Group"] + safe_overview_columns + ["Evidence summary", "Status", "auto_group_key"])
-            )
 
             st.markdown("#### Spreadsheet overview")
             st.caption("Shows only the primary column and selected `Dedupe based on` factor columns for each suggested safe group.")
 
-            selector = st.columns([4, 1.3, 1.3])
-            default_selector_index = visible_group_keys.index(selected_open_group_key) if selected_open_group_key in visible_group_keys else 0
-            selected_group_key = selector[0].selectbox(
-                "Select a group to review",
-                visible_group_keys,
-                index=default_selector_index,
-                key="auto_group_selector",
-                format_func=lambda key: (
-                    f"{group_context_by_key[key]['group_id']} | {visible_auto_groups_df[visible_auto_groups_df['auto_group_key'] == key].iloc[0]['canonical_name']} "
-                    f"| {len(group_context_by_key[key]['group_names'])} names | status: {group_context_by_key[key]['status']}"
-                ),
-            )
-            if selector[1].button("Open group", width="stretch", key="auto_open_group_button"):
-                st.session_state["auto_open_group_key"] = selected_group_key
-                st.session_state["auto_index"] = visible_group_keys.index(selected_group_key)
-                st.rerun()
-            if selector[2].button(
-                "Close detail view",
-                width="stretch",
-                key="auto_close_group_button",
-                disabled=st.session_state.get("auto_open_group_key") is None,
-            ):
-                st.session_state["auto_open_group_key"] = None
-                st.rerun()
+            for group_key in visible_group_keys:
+                context = group_context_by_key[group_key]
+                with st.container(border=True):
+                    group_block = st.columns([1.6, 6])
+                    if group_block[0].button(
+                        f"Open group {context['group_id']}",
+                        width="stretch",
+                        key=f"auto_open_group_{group_key}",
+                    ):
+                        st.session_state["auto_open_group_key"] = group_key
+                        st.session_state["auto_index"] = visible_group_keys.index(group_key)
+                        st.rerun()
 
-            overview_columns = ["Review", "Group"] + safe_overview_columns + ["Evidence summary", "Status"]
-            st.dataframe(overview_df[overview_columns], width="stretch", hide_index=True)
+                    with group_block[1]:
+                        st.markdown(
+                            f"**Group {context['group_id']}** | **Suggested canonical:** {context['canonical_name']} "
+                            f"| **{context['member_count']} names** | **Status:** {context['status']}"
+                        )
+                        group_rows_for_overview = context["group_rows"]
+                        if group_rows_for_overview.empty:
+                            st.info("No source rows found for this group under the current primary column mapping.")
+                        else:
+                            st.dataframe(group_rows_for_overview[safe_overview_columns], width="stretch", hide_index=True)
+                        st.caption(f"Why suggested: {context['evidence_summary']}")
 
             open_group_key = st.session_state.get("auto_open_group_key")
             if open_group_key and open_group_key in group_context_by_key:
