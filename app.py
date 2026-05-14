@@ -1,6 +1,7 @@
 import io
 import json
 import hashlib
+import html
 from copy import deepcopy
 from uuid import uuid4
 
@@ -283,6 +284,28 @@ def show_summary_card(title: str, data: dict):
     if data.get("sample_notes"):
         st.markdown(f"**Sample notes:** {data['sample_notes']}")
 
+def render_prominent_name(name: object, side_label: str, align: str = "left"):
+    safe_side_label = html.escape(str(side_label))
+    safe_name = html.escape(str(name or ""))
+    st.markdown(
+        (
+            f"<div style='text-align:{align}; line-height:1.15;'>"
+            f"<div style='font-size:0.85rem; font-weight:600; opacity:0.75;'>{safe_side_label}</div>"
+            f"<div style='font-size:2.0rem; font-weight:700; margin-top:0.1rem;'>{safe_name}</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+def auto_group_names_for_display(group_row: pd.Series) -> list[str]:
+    members_list = group_row.get("members_list", [])
+    if isinstance(members_list, list):
+        names = [str(name).strip() for name in members_list if str(name).strip()]
+        if names:
+            return names
+    member_names = str(group_row.get("member_names", "") or "")
+    return [part.strip() for part in member_names.split("|") if part.strip()]
+
 def evidence_summary_from_scores(evidence_scores: object) -> str:
     if not isinstance(evidence_scores, list):
         return ""
@@ -310,7 +333,7 @@ def app():
     init_state()
 
     st.title(APP_TITLE)
-    st.caption("Duplicate-review workflow with safe auto-merges, manual review, history, and export.")
+    st.caption("Duplicate-review workflow with suggested safe groups, manual review, history, and export.")
 
     with st.sidebar:
         st.subheader("Workbook")
@@ -659,8 +682,8 @@ def app():
     tabs = st.tabs(["Safe Auto-Merges", "Manual Review Queue", "Review History", "Export"])
 
     with tabs[0]:
-        st.subheader("Safe auto-merges")
-        st.write("These merges trigger only when names share the same strict key after removing punctuation, case, and spaces.")
+        st.subheader("Suggested safe groups")
+        st.write("These are suggested safe groups based on strict-name matches. Nothing changes until you review and accept.")
 
         auto_preview_df = auto_groups_df.copy()
         auto_preview_df["status"] = auto_preview_df["auto_group_key"].map(lambda gid: st.session_state["auto_status"].get(gid, "pending"))
@@ -673,10 +696,10 @@ def app():
         auto_decision_count = len(st.session_state["auto_status"])
 
         st.caption(f"Diagnostics — generated: {len(auto_preview_df)} | visible: {len(visible_auto_groups_df)} | reviewed hidden: {reviewed_auto_hidden_count}")
-        with st.expander("Bulk actions", expanded=True):
+        with st.expander("Bulk review actions", expanded=True):
             actions = st.columns(3)
             if actions[0].button(
-                "Accept all safe auto-merges",
+                "Review and accept all suggested safe groups",
                 width="stretch",
                 key="auto_bulk_accept_button",
                 disabled=not has_auto_groups,
@@ -686,7 +709,7 @@ def app():
                 st.session_state["auto_index"] = 0
                 st.rerun()
             if actions[1].button(
-                "Reject all safe auto-merges",
+                "Reject all suggested safe groups",
                 width="stretch",
                 key="auto_bulk_reject_button",
                 disabled=not has_auto_groups,
@@ -696,7 +719,7 @@ def app():
                 st.session_state["auto_index"] = 0
                 st.rerun()
             if actions[2].button(
-                "Clear all auto-merge decisions",
+                "Clear all safe-group decisions",
                 width="stretch",
                 key="clear_all_auto_decisions_button",
                 disabled=auto_decision_count == 0,
@@ -705,34 +728,46 @@ def app():
                 st.session_state["auto_index"] = 0
                 st.rerun()
             if auto_decision_count == 0:
-                st.info("No saved auto-merge decisions to clear.")
+                st.info("No saved safe-group decisions to clear.")
 
         if visible_auto_groups_df.empty:
-            st.info("No visible safe auto-groups under the current settings.")
+            st.info("No visible suggested safe groups under the current settings.")
             if hide_reviewed_candidates and reviewed_auto_hidden_count > 0:
-                st.info("Some reviewed auto-groups are hidden. Turn off Hide reviewed candidates to inspect them.")
+                st.info("Some reviewed suggested safe groups are hidden. Turn off Hide reviewed candidates to inspect them.")
         else:
             idx = min(st.session_state["auto_index"], len(visible_auto_groups_df) - 1)
             st.session_state["auto_index"] = idx
             row = visible_auto_groups_df.iloc[idx]
             status = st.session_state["auto_status"].get(row["auto_group_key"], "pending")
+            group_names = auto_group_names_for_display(row)
+            group_names_text = ", ".join(group_names) if group_names else "—"
+            group_size_value = row.get("member_count")
+            if pd.notna(group_size_value):
+                try:
+                    group_size = int(group_size_value)
+                except (TypeError, ValueError):
+                    group_size = len(group_names)
+            else:
+                group_size = len(group_names)
 
             with st.container(border=True):
-                info = st.columns([2, 1.5, 1.5, 2])
-                info[0].markdown(f"### Group {idx + 1} of {len(visible_auto_groups_df)}")
-                info[1].markdown(f"**Status:** {status}")
-                info[2].markdown(f"**Canonical:** {row['canonical_name']}")
-                info[3].markdown(f"**Reason:** {row['reasons']}")
+                st.markdown(f"### Suggested safe group {idx + 1} of {len(visible_auto_groups_df)}")
+                summary = st.columns([1.2, 1.8, 2.8])
+                summary[0].markdown(f"**Status:** {status}")
+                summary[1].markdown(f"**Suggested canonical:** {row['canonical_name']}")
+                summary[2].markdown(f"**{group_size} names in this suggested safe group**")
+                st.markdown(f"**Names in this group:** {group_names_text}")
+                st.markdown(f"**Reason / evidence:** {row['reasons'] or '—'}")
             nav = st.columns(5)
             if nav[0].button("Previous", width="stretch", key="auto_prev_button"):
                 st.session_state["auto_index"] = max(st.session_state["auto_index"] - 1, 0)
                 st.rerun()
-            if nav[1].button("Accept", width="stretch", key="auto_accept_button"):
+            if nav[1].button("Review and accept", width="stretch", key="auto_accept_button"):
                 st.session_state["auto_status"][row["auto_group_key"]] = "accepted"
                 if not hide_reviewed_candidates:
                     st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
                 st.rerun()
-            if nav[2].button("Reject", width="stretch", key="auto_reject_button"):
+            if nav[2].button("Reject group", width="stretch", key="auto_reject_button"):
                 st.session_state["auto_status"][row["auto_group_key"]] = "rejected"
                 if not hide_reviewed_candidates:
                     st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
@@ -744,23 +779,23 @@ def app():
                 st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
                 st.rerun()
 
-            detail = st.columns(4)
-            detail[0].metric("Member names", row["member_count"])
-            detail[1].metric("Total rows", row["total_rows"])
-            detail[2].metric("Min year", row["min_year"] if pd.notna(row["min_year"]) else "—")
-            detail[3].metric("Max year", row["max_year"] if pd.notna(row["max_year"]) else "—")
+            with st.expander("Additional group context", expanded=False):
+                detail = st.columns(4)
+                detail[0].metric("Member names", row["member_count"])
+                detail[1].metric("Total rows", row["total_rows"])
+                detail[2].metric("Min year", row["min_year"] if pd.notna(row["min_year"]) else "—")
+                detail[3].metric("Max year", row["max_year"] if pd.notna(row["max_year"]) else "—")
+                st.markdown(f"**Units:** {row['units'] or '—'}")
+                st.markdown(f"**Vessel types:** {row['vessel_types'] or '—'}")
+                st.caption(f"Evidence rows per side slider is set to {sample_rows}.")
 
-            st.markdown(f"**Members:** {row['member_names']}")
-            st.markdown(f"**Units:** {row['units'] or '—'}")
-            st.markdown(f"**Vessel types:** {row['vessel_types'] or '—'}")
-            st.caption(f"Evidence rows per side slider is set to {sample_rows}.")
-
-            preview = auto_preview_df[["auto_group_id", "auto_group_key", "canonical_name", "member_count", "total_rows", "reasons", "status"]].copy()
-            st.dataframe(preview, width="stretch", hide_index=True)
+            with st.expander("All suggested safe groups", expanded=False):
+                preview = auto_preview_df[["auto_group_id", "auto_group_key", "canonical_name", "member_count", "total_rows", "reasons", "status"]].copy()
+                st.dataframe(preview, width="stretch", hide_index=True)
 
     with tabs[1]:
         st.subheader("Manual review queue")
-        st.write("These are the remaining ambiguous candidates after any accepted safe auto-merges are removed from review.")
+        st.write("These are remaining ambiguous candidates after accepted suggested safe groups are removed from manual review.")
 
         st.caption(f"Diagnostics — generated: {len(full_queue_df)} | score-filtered: {len(score_filtered_queue_df)} | visible: {len(visible_queue_df)} | reviewed hidden: {reviewed_hidden_count}")
         st.caption("Name similarity cutoff controls candidate generation. Minimum final score filters generated candidates after evidence scoring.")
@@ -782,11 +817,20 @@ def app():
                 st.session_state[reviewer_comment_key] = saved_reviewer_comment
 
             with st.container(border=True):
-                info = st.columns([2, 1.3, 1.3, 2])
-                info[0].markdown(f"### Candidate {idx + 1} of {len(visible_queue_df)}")
-                info[1].markdown(f"**Score:** `{row['score']:.3f}`")
-                info[2].markdown(f"**Decision:** {decision}")
-                info[3].markdown(f"**Suggested canonical:** {row['suggested_canonical']}")
+                st.markdown(f"### Candidate {idx + 1} of {len(visible_queue_df)}")
+                pair_names = st.columns([4, 1, 4])
+                with pair_names[0]:
+                    render_prominent_name(row["name_a"], "Side A", align="left")
+                with pair_names[1]:
+                    st.markdown("<div style='text-align:center; font-size:1.45rem; font-weight:700; margin-top:0.8rem;'>vs</div>", unsafe_allow_html=True)
+                with pair_names[2]:
+                    render_prominent_name(row["name_b"], "Side B", align="right")
+
+                info = st.columns(3)
+                info[0].markdown(f"**Score:** `{row['score']:.3f}`")
+                info[1].markdown(f"**Decision status:** {decision}")
+                info[2].markdown(f"**Suggested canonical:** {row['suggested_canonical']}")
+                st.markdown(f"**Reasons:** {row['reasons']}")
 
             st.text_area(
                 "Reviewer comment / reasoning",
@@ -848,9 +892,6 @@ def app():
                 st.rerun()
             if not has_current_decision:
                 st.caption("No saved decision for this pair yet. Undo is enabled after Merge, Keep separate, or Unsure.")
-
-            st.markdown("#### Why this pair was flagged")
-            st.write(row["reasons"])
 
             cols = st.columns(2)
             with cols[0]:
