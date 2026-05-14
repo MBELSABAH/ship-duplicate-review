@@ -53,6 +53,7 @@ def init_state():
         "auto_status": {},
         "manual_decisions": {},
         "auto_index": 0,
+        "auto_open_group_key": None,
         "pair_index": 0,
         "column_config": {},
         "evidence_fields": [],
@@ -72,6 +73,7 @@ def reset_decision_state():
     st.session_state["auto_status"] = {}
     st.session_state["manual_decisions"] = {}
     st.session_state["auto_index"] = 0
+    st.session_state["auto_open_group_key"] = None
     st.session_state["pair_index"] = 0
     st.session_state["queue_settings_fingerprint"] = None
     if "pair_decisions" in st.session_state:
@@ -305,6 +307,80 @@ def auto_group_names_for_display(group_row: pd.Series) -> list[str]:
             return names
     member_names = str(group_row.get("member_names", "") or "")
     return [part.strip() for part in member_names.split("|") if part.strip()]
+
+def format_summary_value(value: object) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        if pd.isna(value):
+            return "—"
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+    if isinstance(value, int):
+        return str(value)
+    return str(value)
+
+def summarize_group_factor(series: pd.Series, column_name: str) -> str:
+    cleaned = series.map(lambda value: "" if pd.isna(value) else str(value).strip())
+    total_count = len(cleaned)
+    nonempty = cleaned[cleaned != ""]
+    missing_count = total_count - len(nonempty)
+    prefix = f"{column_name}: "
+
+    if total_count == 0 or nonempty.empty:
+        return f"{prefix}unavailable"
+
+    lower_column_name = str(column_name).lower()
+    if "year" in lower_column_name:
+        year_values = pd.to_numeric(nonempty, errors="coerce").dropna()
+        if not year_values.empty:
+            min_year = int(year_values.min())
+            max_year = int(year_values.max())
+            year_text = str(min_year) if min_year == max_year else f"{min_year}–{max_year}"
+        else:
+            unique_values = sorted(set(nonempty.tolist()))
+            if len(unique_values) == 1:
+                year_text = unique_values[0]
+            else:
+                year_text = f"{unique_values[0]}–{unique_values[-1]}"
+        if missing_count > 0:
+            return f"{prefix}missing for some rows"
+        return f"{prefix}{year_text}"
+
+    numeric_values = pd.to_numeric(nonempty, errors="coerce")
+    numeric_nonempty = numeric_values.dropna()
+    if len(numeric_nonempty) == len(nonempty):
+        min_value = numeric_nonempty.min()
+        max_value = numeric_nonempty.max()
+        if min_value == max_value:
+            summary = f"all same ({format_summary_value(min_value)})"
+        else:
+            summary = f"range {format_summary_value(min_value)}–{format_summary_value(max_value)}"
+    else:
+        unique_values = sorted(set(nonempty.tolist()))
+        if len(unique_values) == 1:
+            summary = f"all same ({unique_values[0]})"
+        elif len(unique_values) <= 3:
+            summary = "values " + ", ".join(unique_values)
+        else:
+            summary = f"{len(unique_values)} distinct values"
+
+    if missing_count > 0:
+        summary += "; missing for some rows"
+    return f"{prefix}{summary}"
+
+def build_safe_group_evidence_summary(
+    group_rows: pd.DataFrame,
+    selected_factor_columns: list[str],
+) -> str:
+    parts = ["Names match after removing punctuation/case/spaces"]
+    for factor_column in selected_factor_columns:
+        if factor_column not in group_rows.columns:
+            parts.append(f"{factor_column}: unavailable")
+            continue
+        parts.append(summarize_group_factor(group_rows[factor_column], factor_column))
+    return "; ".join(parts)
 
 def evidence_summary_from_scores(evidence_scores: object) -> str:
     if not isinstance(evidence_scores, list):
@@ -694,6 +770,10 @@ def app():
         reviewed_auto_hidden_count = len(auto_preview_df) - len(visible_auto_groups_df) if hide_reviewed_candidates else 0
         has_auto_groups = not auto_groups_df.empty
         auto_decision_count = len(st.session_state["auto_status"])
+        selected_factor_columns = [f.get("column") for f in column_config.get("evidence_fields", []) if f.get("column")]
+        selected_factor_columns = [column for column in selected_factor_columns if column in raw_df.columns and column != column_config["entity_column"]]
+        selected_factor_columns = list(dict.fromkeys(selected_factor_columns))
+        safe_overview_columns = [column_config["entity_column"]] + selected_factor_columns
 
         st.caption(f"Diagnostics — generated: {len(auto_preview_df)} | visible: {len(visible_auto_groups_df)} | reviewed hidden: {reviewed_auto_hidden_count}")
         with st.expander("Bulk review actions", expanded=True):
@@ -735,63 +815,140 @@ def app():
             if hide_reviewed_candidates and reviewed_auto_hidden_count > 0:
                 st.info("Some reviewed suggested safe groups are hidden. Turn off Hide reviewed candidates to inspect them.")
         else:
-            idx = min(st.session_state["auto_index"], len(visible_auto_groups_df) - 1)
-            st.session_state["auto_index"] = idx
-            row = visible_auto_groups_df.iloc[idx]
-            status = st.session_state["auto_status"].get(row["auto_group_key"], "pending")
-            group_names = auto_group_names_for_display(row)
-            group_names_text = ", ".join(group_names) if group_names else "—"
-            group_size_value = row.get("member_count")
-            if pd.notna(group_size_value):
-                try:
-                    group_size = int(group_size_value)
-                except (TypeError, ValueError):
+            visible_group_keys = visible_auto_groups_df["auto_group_key"].tolist()
+            selected_open_group_key = st.session_state.get("auto_open_group_key")
+            if selected_open_group_key and selected_open_group_key not in visible_group_keys:
+                st.session_state["auto_open_group_key"] = None
+                selected_open_group_key = None
+
+            entity_values = raw_df[column_config["entity_column"]].fillna("").astype(str).str.strip()
+            overview_frames = []
+            group_context_by_key = {}
+            for _, group_row in visible_auto_groups_df.iterrows():
+                group_key = group_row["auto_group_key"]
+                group_id = group_row.get("auto_group_id", group_key)
+                group_status = st.session_state["auto_status"].get(group_key, "pending")
+                group_names = auto_group_names_for_display(group_row)
+                if group_names:
+                    group_mask = entity_values.isin(set(group_names))
+                    group_rows = raw_df.loc[group_mask, safe_overview_columns].copy()
+                else:
+                    group_rows = pd.DataFrame(columns=safe_overview_columns)
+                evidence_summary = build_safe_group_evidence_summary(group_rows, selected_factor_columns)
+                display_rows = group_rows.copy()
+                if display_rows.empty:
+                    display_rows = pd.DataFrame([{column: "—" for column in safe_overview_columns}])
+                display_rows.insert(0, "Review", "Open group")
+                display_rows.insert(1, "Group", group_id)
+                display_rows["Evidence summary"] = evidence_summary
+                display_rows["Status"] = group_status
+                display_rows["auto_group_key"] = group_key
+                overview_frames.append(display_rows)
+                group_context_by_key[group_key] = {
+                    "group_id": group_id,
+                    "status": group_status,
+                    "group_names": group_names,
+                    "group_rows": group_rows,
+                    "evidence_summary": evidence_summary,
+                }
+
+            overview_df = (
+                pd.concat(overview_frames, ignore_index=True)
+                if overview_frames
+                else pd.DataFrame(columns=["Review", "Group"] + safe_overview_columns + ["Evidence summary", "Status", "auto_group_key"])
+            )
+
+            st.markdown("#### Spreadsheet overview")
+            st.caption("Shows only the primary column and selected `Dedupe based on` factor columns for each suggested safe group.")
+
+            selector = st.columns([4, 1.3, 1.3])
+            default_selector_index = visible_group_keys.index(selected_open_group_key) if selected_open_group_key in visible_group_keys else 0
+            selected_group_key = selector[0].selectbox(
+                "Select a group to review",
+                visible_group_keys,
+                index=default_selector_index,
+                key="auto_group_selector",
+                format_func=lambda key: (
+                    f"{group_context_by_key[key]['group_id']} | {visible_auto_groups_df[visible_auto_groups_df['auto_group_key'] == key].iloc[0]['canonical_name']} "
+                    f"| {len(group_context_by_key[key]['group_names'])} names | status: {group_context_by_key[key]['status']}"
+                ),
+            )
+            if selector[1].button("Open group", width="stretch", key="auto_open_group_button"):
+                st.session_state["auto_open_group_key"] = selected_group_key
+                st.session_state["auto_index"] = visible_group_keys.index(selected_group_key)
+                st.rerun()
+            if selector[2].button(
+                "Close detail view",
+                width="stretch",
+                key="auto_close_group_button",
+                disabled=st.session_state.get("auto_open_group_key") is None,
+            ):
+                st.session_state["auto_open_group_key"] = None
+                st.rerun()
+
+            overview_columns = ["Review", "Group"] + safe_overview_columns + ["Evidence summary", "Status"]
+            st.dataframe(overview_df[overview_columns], width="stretch", hide_index=True)
+
+            open_group_key = st.session_state.get("auto_open_group_key")
+            if open_group_key and open_group_key in group_context_by_key:
+                row = visible_auto_groups_df[visible_auto_groups_df["auto_group_key"] == open_group_key].iloc[0]
+                group_context = group_context_by_key[open_group_key]
+                position = visible_group_keys.index(open_group_key)
+                group_names = group_context["group_names"]
+                group_names_text = ", ".join(group_names) if group_names else "—"
+                group_size_value = row.get("member_count")
+                if pd.notna(group_size_value):
+                    try:
+                        group_size = int(group_size_value)
+                    except (TypeError, ValueError):
+                        group_size = len(group_names)
+                else:
                     group_size = len(group_names)
-            else:
-                group_size = len(group_names)
 
-            with st.container(border=True):
-                st.markdown(f"### Suggested safe group {idx + 1} of {len(visible_auto_groups_df)}")
-                summary = st.columns([1.2, 1.8, 2.8])
-                summary[0].markdown(f"**Status:** {status}")
-                summary[1].markdown(f"**Suggested canonical:** {row['canonical_name']}")
-                summary[2].markdown(f"**{group_size} names in this suggested safe group**")
-                st.markdown(f"**Names in this group:** {group_names_text}")
-                st.markdown(f"**Reason / evidence:** {row['reasons'] or '—'}")
-            nav = st.columns(5)
-            if nav[0].button("Previous", width="stretch", key="auto_prev_button"):
-                st.session_state["auto_index"] = max(st.session_state["auto_index"] - 1, 0)
-                st.rerun()
-            if nav[1].button("Review and accept", width="stretch", key="auto_accept_button"):
-                st.session_state["auto_status"][row["auto_group_key"]] = "accepted"
-                if not hide_reviewed_candidates:
-                    st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
-                st.rerun()
-            if nav[2].button("Reject group", width="stretch", key="auto_reject_button"):
-                st.session_state["auto_status"][row["auto_group_key"]] = "rejected"
-                if not hide_reviewed_candidates:
-                    st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
-                st.rerun()
-            if nav[3].button("Undo", width="stretch", key="auto_undo_button"):
-                st.session_state["auto_status"].pop(row["auto_group_key"], None)
-                st.rerun()
-            if nav[4].button("Next", width="stretch", key="auto_next_button"):
-                st.session_state["auto_index"] = min(st.session_state["auto_index"] + 1, len(visible_auto_groups_df) - 1)
-                st.rerun()
+                st.markdown("#### Selected group detail")
+                with st.container(border=True):
+                    st.markdown(f"### Suggested safe group {position + 1} of {len(visible_auto_groups_df)}")
+                    summary = st.columns([1.2, 1.8, 2.8])
+                    summary[0].markdown(f"**Status:** {group_context['status']}")
+                    summary[1].markdown(f"**Suggested canonical:** {row['canonical_name']}")
+                    summary[2].markdown(f"**{group_size} names in this suggested safe group**")
+                    st.markdown(f"**Names in this group:** {group_names_text}")
+                    st.markdown(f"**Reason / evidence summary:** {group_context['evidence_summary']}")
+                    if row.get("reasons"):
+                        st.caption(f"Strict match rationale: {row['reasons']}")
 
-            with st.expander("Additional group context", expanded=False):
-                detail = st.columns(4)
-                detail[0].metric("Member names", row["member_count"])
-                detail[1].metric("Total rows", row["total_rows"])
-                detail[2].metric("Min year", row["min_year"] if pd.notna(row["min_year"]) else "—")
-                detail[3].metric("Max year", row["max_year"] if pd.notna(row["max_year"]) else "—")
-                st.markdown(f"**Units:** {row['units'] or '—'}")
-                st.markdown(f"**Vessel types:** {row['vessel_types'] or '—'}")
-                st.caption(f"Evidence rows per side slider is set to {sample_rows}.")
+                detail_actions = st.columns(4)
+                if detail_actions[0].button("Review and accept", width="stretch", key="auto_accept_selected_button"):
+                    st.session_state["auto_status"][open_group_key] = "accepted"
+                    if hide_reviewed_candidates:
+                        st.session_state["auto_open_group_key"] = None
+                    st.rerun()
+                if detail_actions[1].button("Reject group", width="stretch", key="auto_reject_selected_button"):
+                    st.session_state["auto_status"][open_group_key] = "rejected"
+                    if hide_reviewed_candidates:
+                        st.session_state["auto_open_group_key"] = None
+                    st.rerun()
+                if detail_actions[2].button("Undo", width="stretch", key="auto_undo_selected_button"):
+                    st.session_state["auto_status"].pop(open_group_key, None)
+                    st.rerun()
+                if detail_actions[3].button("Back to overview", width="stretch", key="auto_back_to_overview_button"):
+                    st.session_state["auto_open_group_key"] = None
+                    st.rerun()
 
-            with st.expander("All suggested safe groups", expanded=False):
-                preview = auto_preview_df[["auto_group_id", "auto_group_key", "canonical_name", "member_count", "total_rows", "reasons", "status"]].copy()
-                st.dataframe(preview, width="stretch", hide_index=True)
+                with st.expander("Rows in this group (primary + selected dedupe-factor columns)", expanded=True):
+                    group_rows_for_detail = group_context["group_rows"]
+                    if group_rows_for_detail.empty:
+                        st.info("No source rows found for this group under the current primary column mapping.")
+                    else:
+                        st.dataframe(group_rows_for_detail, width="stretch", hide_index=True)
+
+                with st.expander("Additional group context", expanded=False):
+                    detail = st.columns(2)
+                    detail[0].metric("Member names", row["member_count"])
+                    detail[1].metric("Total rows", row["total_rows"])
+                    st.markdown(f"**Units:** {row['units'] or '—'}")
+                    st.markdown(f"**Vessel types:** {row['vessel_types'] or '—'}")
+                    st.caption(f"Evidence rows per side slider is set to {sample_rows}.")
 
     with tabs[1]:
         st.subheader("Manual review queue")
